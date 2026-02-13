@@ -3,6 +3,7 @@ package dispatcher
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -71,5 +72,93 @@ func TestTTLCacheRejectsNilLoader(t *testing.T) {
 	_, err := cache.GetOrLoad(context.Background(), "k", nil)
 	if !errors.Is(err, ErrNilLoader) {
 		t.Fatalf("expected ErrNilLoader, got %v", err)
+	}
+}
+
+func TestTTLCacheGetOrLoadLoaderPanicDoesNotPoisonKey(t *testing.T) {
+	cache := NewTTLCache[string, int](time.Second)
+
+	_, err := cache.GetOrLoad(context.Background(), "panic", func(_ context.Context, _ string) (int, error) {
+		panic("boom")
+	})
+	if err == nil || !strings.Contains(err.Error(), "panic") {
+		t.Fatalf("expected panic-based error, got %v", err)
+	}
+
+	value, err := cache.GetOrLoad(context.Background(), "panic", func(_ context.Context, _ string) (int, error) {
+		return 7, nil
+	})
+	if err != nil {
+		t.Fatalf("expected successful reload after panic, got %v", err)
+	}
+	if value != 7 {
+		t.Fatalf("unexpected value after reload: %d", value)
+	}
+}
+
+func TestTTLCacheGetOrLoadLoaderPanicUnblocksWaiters(t *testing.T) {
+	cache := NewTTLCache[string, int](time.Second)
+	started := make(chan struct{})
+	release := make(chan struct{})
+
+	leaderDone := make(chan error, 1)
+	go func() {
+		_, err := cache.GetOrLoad(context.Background(), "k", func(_ context.Context, _ string) (int, error) {
+			close(started)
+			<-release
+			panic("panic-leader")
+		})
+		leaderDone <- err
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("leader loader was not started")
+	}
+
+	type waiterResult struct {
+		value int
+		err   error
+	}
+
+	waiterDone := make(chan waiterResult, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+
+		value, err := cache.GetOrLoad(ctx, "k", func(_ context.Context, _ string) (int, error) {
+			return 999, nil
+		})
+		waiterDone <- waiterResult{value: value, err: err}
+	}()
+
+	close(release)
+
+	select {
+	case err := <-leaderDone:
+		if err == nil || !strings.Contains(err.Error(), "panic") {
+			t.Fatalf("expected panic-based leader error, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("leader did not finish")
+	}
+
+	select {
+	case result := <-waiterDone:
+		if errors.Is(result.err, context.DeadlineExceeded) {
+			t.Fatalf("waiter timed out waiting for in-flight completion")
+		}
+		if result.err == nil {
+			if result.value != 999 {
+				t.Fatalf("unexpected waiter value: %d", result.value)
+			}
+			return
+		}
+		if !strings.Contains(result.err.Error(), "panic") {
+			t.Fatalf("unexpected waiter error: %v", result.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waiter did not finish")
 	}
 }

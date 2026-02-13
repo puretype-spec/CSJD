@@ -3,6 +3,7 @@ package dispatcher
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -209,7 +210,7 @@ dispatch:
 		return true
 	}
 
-	results, err := l.fetch(l.runCtx, keys)
+	results, err := l.safeFetch(keys)
 	if err != nil {
 		if errors.Is(err, context.Canceled) && l.isClosed() {
 			l.respondMap(activeKeys, batchReply[V]{err: ErrBatchLoaderClosed})
@@ -231,6 +232,19 @@ dispatch:
 	}
 
 	return true
+}
+
+func (l *BatchLoader[K, V]) safeFetch(keys []K) (results map[K]V, err error) {
+	defer func() {
+		recovered := recover()
+		if recovered == nil {
+			return
+		}
+
+		err = fmt.Errorf("batch fetch panic: %v", recovered)
+	}()
+
+	return l.fetch(l.runCtx, keys)
 }
 
 func (l *BatchLoader[K, V]) rejectQueuedRequests(err error) {

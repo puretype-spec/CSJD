@@ -3,6 +3,7 @@ package dispatcher
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -147,7 +148,23 @@ func (c *TTLCache[K, V]) GetOrLoad(ctx context.Context, key K, loader func(conte
 	c.inFlight[key] = call
 	c.mu.Unlock()
 
-	value, err := loader(ctx, key)
+	var (
+		value V
+		err   error
+	)
+
+	func() {
+		defer func() {
+			recovered := recover()
+			if recovered == nil {
+				return
+			}
+
+			err = fmt.Errorf("cache loader panic: %v", recovered)
+		}()
+
+		value, err = loader(ctx, key)
+	}()
 
 	c.mu.Lock()
 	if err == nil {

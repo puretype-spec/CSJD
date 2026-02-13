@@ -3,6 +3,7 @@ package dispatcher
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -158,5 +159,38 @@ func TestBatchLoaderCloseCancelsInFlightFetch(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("load call did not return")
+	}
+}
+
+func TestBatchLoaderFetchPanicReturnsErrorAndKeepsLoopAlive(t *testing.T) {
+	var calls atomic.Int32
+	loader, err := NewBatchLoader[int, int](BatchLoaderConfig{MaxBatch: 1, MaxWait: 5 * time.Millisecond}, func(_ context.Context, keys []int) (map[int]int, error) {
+		if calls.Add(1) == 1 {
+			panic("fetch panic")
+		}
+
+		out := make(map[int]int, len(keys))
+		for _, key := range keys {
+			out[key] = key * 10
+		}
+
+		return out, nil
+	})
+	if err != nil {
+		t.Fatalf("new batch loader: %v", err)
+	}
+	defer loader.Close()
+
+	_, err = loader.Load(context.Background(), 1)
+	if err == nil || !strings.Contains(err.Error(), "panic") {
+		t.Fatalf("expected panic-based error, got %v", err)
+	}
+
+	value, err := loader.Load(context.Background(), 2)
+	if err != nil {
+		t.Fatalf("expected loader to keep running after panic, got %v", err)
+	}
+	if value != 20 {
+		t.Fatalf("unexpected value: %d", value)
 	}
 }

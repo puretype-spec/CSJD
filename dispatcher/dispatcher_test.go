@@ -202,6 +202,138 @@ func TestDispatcherRejectsWhenStopped(t *testing.T) {
 	}
 }
 
+func TestDispatcherStopWithNilContext(t *testing.T) {
+	d, err := New(Config{Workers: 1, RetryJitter: 0})
+	if err != nil {
+		t.Fatalf("new dispatcher: %v", err)
+	}
+
+	err = d.RegisterHandler("noop", func(_ context.Context, _ Job) error { return nil })
+	if err != nil {
+		t.Fatalf("register handler: %v", err)
+	}
+
+	if err = d.Start(); err != nil {
+		t.Fatalf("start dispatcher: %v", err)
+	}
+
+	if err = d.Stop(nil); err != nil {
+		t.Fatalf("stop with nil context failed: %v", err)
+	}
+}
+
+func TestDispatcherCopiesPayloadOnSubmit(t *testing.T) {
+	d, err := New(Config{Workers: 1, RetryJitter: 0})
+	if err != nil {
+		t.Fatalf("new dispatcher: %v", err)
+	}
+
+	release := make(chan struct{})
+	received := make(chan []byte, 1)
+
+	err = d.RegisterHandler("copy", func(_ context.Context, job Job) error {
+		<-release
+		copied := append([]byte(nil), job.Payload...)
+		received <- copied
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("register handler: %v", err)
+	}
+
+	if err = d.Start(); err != nil {
+		t.Fatalf("start dispatcher: %v", err)
+	}
+
+	payload := []byte("alpha")
+	if err = d.Submit(Job{ID: "payload-submit", Type: "copy", Payload: payload}); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+
+	payload[0] = 'x'
+	close(release)
+
+	select {
+	case got := <-received:
+		if string(got) != "alpha" {
+			t.Fatalf("payload was mutated after submit: %q", string(got))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for handler result")
+	}
+
+	stopCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err = d.Stop(stopCtx); err != nil {
+		t.Fatalf("stop dispatcher: %v", err)
+	}
+}
+
+func TestDispatcherCopiesPayloadOnSubmitBatch(t *testing.T) {
+	d, err := New(Config{Workers: 1, RetryJitter: 0})
+	if err != nil {
+		t.Fatalf("new dispatcher: %v", err)
+	}
+
+	release := make(chan struct{})
+	type result struct {
+		id      string
+		payload string
+	}
+	results := make(chan result, 2)
+
+	err = d.RegisterHandler("copy-batch", func(_ context.Context, job Job) error {
+		<-release
+		results <- result{id: job.ID, payload: string(job.Payload)}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("register handler: %v", err)
+	}
+
+	if err = d.Start(); err != nil {
+		t.Fatalf("start dispatcher: %v", err)
+	}
+
+	payloadA := []byte("first")
+	payloadB := []byte("second")
+
+	report := d.SubmitBatch([]Job{
+		{ID: "batch-a", Type: "copy-batch", Payload: payloadA},
+		{ID: "batch-b", Type: "copy-batch", Payload: payloadB},
+	})
+	if report.Accepted != 2 {
+		t.Fatalf("expected 2 accepted jobs, got %d", report.Accepted)
+	}
+
+	payloadA[0] = 'X'
+	payloadB[0] = 'Y'
+	close(release)
+
+	collected := map[string]string{}
+	for i := 0; i < 2; i++ {
+		select {
+		case item := <-results:
+			collected[item.id] = item.payload
+		case <-time.After(2 * time.Second):
+			t.Fatal("timeout waiting batch handler results")
+		}
+	}
+
+	if collected["batch-a"] != "first" {
+		t.Fatalf("batch-a payload was mutated: %q", collected["batch-a"])
+	}
+	if collected["batch-b"] != "second" {
+		t.Fatalf("batch-b payload was mutated: %q", collected["batch-b"])
+	}
+
+	stopCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err = d.Stop(stopCtx); err != nil {
+		t.Fatalf("stop dispatcher: %v", err)
+	}
+}
+
 func waitForCondition(t *testing.T, timeout time.Duration, condition func() bool) {
 	t.Helper()
 

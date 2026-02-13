@@ -123,6 +123,10 @@ func (d *Dispatcher) Start() error {
 
 // Stop drains pending work and waits until workers finish, or returns when ctx expires.
 func (d *Dispatcher) Stop(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	d.stateMu.Lock()
 	if !d.started {
 		d.stateMu.Unlock()
@@ -175,6 +179,7 @@ func (d *Dispatcher) Submit(job Job) error {
 	if job.CreatedAt.IsZero() {
 		job.CreatedAt = now
 	}
+	job.Payload = cloneBytes(job.Payload)
 
 	d.inFlight[job.ID] = struct{}{}
 	heap.Push(&d.pending, scheduledJob{job: job, attempt: 1, runAt: now})
@@ -233,6 +238,7 @@ func (d *Dispatcher) SubmitBatch(jobs []Job) BatchSubmitReport {
 		if job.CreatedAt.IsZero() {
 			job.CreatedAt = now
 		}
+		job.Payload = cloneBytes(job.Payload)
 
 		d.inFlight[job.ID] = struct{}{}
 		heap.Push(&d.pending, scheduledJob{job: job, attempt: 1, runAt: now})
@@ -509,4 +515,15 @@ func (d *Dispatcher) cancelRunContext() {
 	if cancel != nil {
 		cancel()
 	}
+}
+
+func cloneBytes(value []byte) []byte {
+	if value == nil {
+		return nil
+	}
+
+	copied := make([]byte, len(value))
+	copy(copied, value)
+
+	return copied
 }
