@@ -399,8 +399,8 @@ func (d *Dispatcher) execute(item scheduledJob) error {
 	jobCtx, cancel := context.WithTimeout(d.runCtx, jobTimeout)
 	defer cancel()
 
-	var handlerErr error
-	func() {
+	handlerErrCh := make(chan error, 1)
+	go func() {
 		defer func() {
 			recovered := recover()
 			if recovered == nil {
@@ -408,19 +408,31 @@ func (d *Dispatcher) execute(item scheduledJob) error {
 			}
 
 			d.metrics.panics.Add(1)
-			handlerErr = MarkPermanent(fmt.Errorf("panic in handler for job %s: %v", item.job.ID, recovered))
+			handlerErrCh <- MarkPermanent(fmt.Errorf("panic in handler for job %s: %v", item.job.ID, recovered))
 		}()
 
-		handlerErr = handler(jobCtx, item.job)
+		handlerErrCh <- handler(jobCtx, item.job)
 	}()
 
-	if handlerErr != nil && errors.Is(handlerErr, context.Canceled) {
-		if d.runCtx.Err() != nil {
-			return MarkPermanent(handlerErr)
+	select {
+	case handlerErr := <-handlerErrCh:
+		if handlerErr != nil && errors.Is(handlerErr, context.Canceled) {
+			if d.runCtx.Err() != nil {
+				return MarkPermanent(handlerErr)
+			}
 		}
-	}
 
-	return handlerErr
+		return handlerErr
+	case <-jobCtx.Done():
+		handlerErr := jobCtx.Err()
+		if errors.Is(handlerErr, context.Canceled) {
+			if d.runCtx.Err() != nil {
+				return MarkPermanent(handlerErr)
+			}
+		}
+
+		return handlerErr
+	}
 }
 
 func (d *Dispatcher) reschedule(item scheduledJob) {

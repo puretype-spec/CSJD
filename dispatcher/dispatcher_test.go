@@ -373,18 +373,15 @@ func TestDispatcherCanRestartAfterStop(t *testing.T) {
 }
 
 func TestDispatcherCanRestartAfterStopTimeoutEventually(t *testing.T) {
-	d, err := New(Config{Workers: 1, RetryJitter: 0, DefaultJobTimeout: 5 * time.Second})
+	d, err := New(Config{Workers: 1, RetryJitter: 0, DefaultJobTimeout: 40 * time.Millisecond})
 	if err != nil {
 		t.Fatalf("new dispatcher: %v", err)
 	}
 
-	err = d.RegisterHandler("slow", func(ctx context.Context, _ Job) error {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(time.Second):
-			return nil
-		}
+	err = d.RegisterHandler("slow", func(_ context.Context, _ Job) error {
+		// Simulate a non-cooperative handler that ignores cancellation.
+		time.Sleep(250 * time.Millisecond)
+		return nil
 	})
 	if err != nil {
 		t.Fatalf("register handler: %v", err)
@@ -397,7 +394,7 @@ func TestDispatcherCanRestartAfterStopTimeoutEventually(t *testing.T) {
 		t.Fatalf("submit slow job: %v", err)
 	}
 
-	stopCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
 	if err = d.Stop(stopCtx); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("expected stop timeout, got %v", err)

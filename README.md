@@ -14,7 +14,7 @@
 - Non-retriable error（`dispatcher.MarkPermanent(err)`）
 - Duplicate 保護（pending + in-flight + recent TTL window）
 - Graceful stop（`Stop(ctx)`）
-- Stop 後可重啟（`Start()`）
+- Stop 後可重啟（`Start()`，前提是 handler 在 timeout 內返回或能響應 `ctx`）
 - Metrics snapshot
 - `TTLCache`（stampede 防護，`GetOrLoad` 單飛）
 - `BatchLoader` 合併並行請求
