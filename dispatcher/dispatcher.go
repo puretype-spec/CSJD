@@ -416,6 +416,10 @@ func (d *Dispatcher) execute(item scheduledJob) error {
 
 	select {
 	case handlerErr := <-handlerErrCh:
+		if handlerErr != nil && errors.Is(handlerErr, context.DeadlineExceeded) {
+			return MarkPermanent(handlerErr)
+		}
+
 		if handlerErr != nil && errors.Is(handlerErr, context.Canceled) {
 			if d.runCtx.Err() != nil {
 				return MarkPermanent(handlerErr)
@@ -425,6 +429,10 @@ func (d *Dispatcher) execute(item scheduledJob) error {
 		return handlerErr
 	case <-jobCtx.Done():
 		handlerErr := jobCtx.Err()
+		if errors.Is(handlerErr, context.DeadlineExceeded) {
+			return MarkPermanent(handlerErr)
+		}
+
 		if errors.Is(handlerErr, context.Canceled) {
 			if d.runCtx.Err() != nil {
 				return MarkPermanent(handlerErr)

@@ -424,6 +424,55 @@ func TestDispatcherCanRestartAfterStopTimeoutEventually(t *testing.T) {
 	}
 }
 
+func TestDispatcherTimeoutDoesNotRetry(t *testing.T) {
+	d, err := New(Config{
+		Workers:            1,
+		RetryJitter:        0,
+		RetryMinDelay:      10 * time.Millisecond,
+		RetryMaxDelay:      20 * time.Millisecond,
+		DefaultJobTimeout:  40 * time.Millisecond,
+		RecentDuplicateTTL: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("new dispatcher: %v", err)
+	}
+
+	var calls atomic.Int32
+	err = d.RegisterHandler("timeout", func(_ context.Context, _ Job) error {
+		calls.Add(1)
+		// Ignore context on purpose to emulate non-cooperative handlers.
+		time.Sleep(200 * time.Millisecond)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("register handler: %v", err)
+	}
+
+	if err = d.Start(); err != nil {
+		t.Fatalf("start dispatcher: %v", err)
+	}
+	if err = d.Submit(Job{ID: "timeout-job", Type: "timeout", MaxAttempts: 5}); err != nil {
+		t.Fatalf("submit timeout job: %v", err)
+	}
+
+	waitForCondition(t, 2*time.Second, func() bool {
+		metrics := d.Metrics()
+		return metrics.Failed == 1
+	})
+
+	metrics := d.Metrics()
+	if metrics.Retried != 0 {
+		t.Fatalf("expected no retries on timeout, got %d", metrics.Retried)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("expected one handler invocation, got %d", calls.Load())
+	}
+
+	if err = d.Stop(context.Background()); err != nil {
+		t.Fatalf("stop dispatcher: %v", err)
+	}
+}
+
 func waitForCondition(t *testing.T, timeout time.Duration, condition func() bool) {
 	t.Helper()
 
