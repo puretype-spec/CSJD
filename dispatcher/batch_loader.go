@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -69,6 +70,7 @@ type BatchLoader[K comparable, V any] struct {
 	runCtx    context.Context
 	runCancel context.CancelFunc
 	runDone   chan struct{}
+	closeOnce sync.Once
 }
 
 // NewBatchLoader starts a batching loop.
@@ -130,19 +132,18 @@ func (l *BatchLoader[K, V]) Load(ctx context.Context, key K) (V, error) {
 }
 
 // Close stops the loader and unblocks pending requests.
+// It does not wait for fetch to return because fetch may ignore cancellation.
 func (l *BatchLoader[K, V]) Close() {
-	select {
-	case <-l.stopCh:
-		return
-	default:
+	l.closeOnce.Do(func() {
 		close(l.stopCh)
-	}
 
-	if l.runCancel != nil {
-		l.runCancel()
-	}
+		if l.runCancel != nil {
+			l.runCancel()
+		}
 
-	<-l.runDone
+		// Best effort: unblock queued requests even when fetch is non-cooperative.
+		l.rejectQueuedRequests(ErrBatchLoaderClosed)
+	})
 }
 
 func (l *BatchLoader[K, V]) run() {

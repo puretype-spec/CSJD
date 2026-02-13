@@ -56,6 +56,8 @@ type Dispatcher struct {
 	backoffRandMu sync.Mutex
 
 	metrics metricsCounters
+
+	handlerSlots chan struct{}
 }
 
 // New creates a dispatcher with validated configuration.
@@ -73,6 +75,14 @@ func New(config Config) (*Dispatcher, error) {
 		inFlight:    make(map[string]struct{}),
 		recent:      newTTLSet(cfg.RecentDuplicateTTL),
 		backoffRand: rand.New(rand.NewSource(time.Now().UnixNano())),
+		handlerSlots: func() chan struct{} {
+			slots := make(chan struct{}, cfg.Workers)
+			for i := 0; i < cfg.Workers; i++ {
+				slots <- struct{}{}
+			}
+
+			return slots
+		}(),
 	}
 	heap.Init(&d.pending)
 
@@ -399,8 +409,24 @@ func (d *Dispatcher) execute(item scheduledJob) error {
 	jobCtx, cancel := context.WithTimeout(d.runCtx, jobTimeout)
 	defer cancel()
 
+	acquireErr := d.acquireHandlerSlot(jobCtx)
+	if acquireErr != nil {
+		if errors.Is(acquireErr, context.DeadlineExceeded) {
+			return MarkPermanent(acquireErr)
+		}
+
+		if errors.Is(acquireErr, context.Canceled) {
+			if d.runCtx.Err() != nil {
+				return MarkPermanent(acquireErr)
+			}
+		}
+
+		return acquireErr
+	}
+
 	handlerErrCh := make(chan error, 1)
 	go func() {
+		defer d.releaseHandlerSlot()
 		defer func() {
 			recovered := recover()
 			if recovered == nil {
@@ -580,4 +606,22 @@ func cloneBytes(value []byte) []byte {
 	copy(copied, value)
 
 	return copied
+}
+
+func (d *Dispatcher) acquireHandlerSlot(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-d.runCtx.Done():
+		return d.runCtx.Err()
+	case <-d.handlerSlots:
+		return nil
+	}
+}
+
+func (d *Dispatcher) releaseHandlerSlot() {
+	select {
+	case d.handlerSlots <- struct{}{}:
+	default:
+	}
 }

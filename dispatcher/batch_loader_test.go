@@ -162,6 +162,60 @@ func TestBatchLoaderCloseCancelsInFlightFetch(t *testing.T) {
 	}
 }
 
+func TestBatchLoaderCloseReturnsWhenFetchIgnoresContext(t *testing.T) {
+	started := make(chan struct{}, 1)
+	releaseFetch := make(chan struct{})
+
+	loader, err := NewBatchLoader[int, int](BatchLoaderConfig{MaxBatch: 1, MaxWait: 5 * time.Millisecond}, func(_ context.Context, _ []int) (map[int]int, error) {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+
+		<-releaseFetch
+
+		return map[int]int{42: 42}, nil
+	})
+	if err != nil {
+		t.Fatalf("new batch loader: %v", err)
+	}
+
+	loadDone := make(chan error, 1)
+	go func() {
+		_, loadErr := loader.Load(context.Background(), 42)
+		loadDone <- loadErr
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("fetch was not started")
+	}
+
+	start := time.Now()
+	loader.Close()
+	if time.Since(start) > 100*time.Millisecond {
+		t.Fatal("loader.Close() should not block on non-cooperative fetch")
+	}
+
+	select {
+	case loadErr := <-loadDone:
+		if !errors.Is(loadErr, ErrBatchLoaderClosed) {
+			t.Fatalf("expected ErrBatchLoaderClosed, got %v", loadErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("load call did not return")
+	}
+
+	close(releaseFetch)
+
+	select {
+	case <-loader.runDone:
+	case <-time.After(time.Second):
+		t.Fatal("run loop did not stop after fetch was released")
+	}
+}
+
 func TestBatchLoaderFetchPanicReturnsErrorAndKeepsLoopAlive(t *testing.T) {
 	var calls atomic.Int32
 	loader, err := NewBatchLoader[int, int](BatchLoaderConfig{MaxBatch: 1, MaxWait: 5 * time.Millisecond}, func(_ context.Context, keys []int) (map[int]int, error) {

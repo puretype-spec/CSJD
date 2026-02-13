@@ -473,6 +473,70 @@ func TestDispatcherTimeoutDoesNotRetry(t *testing.T) {
 	}
 }
 
+func TestDispatcherTimeoutDoesNotCreateOverlappingHandlerExecutions(t *testing.T) {
+	d, err := New(Config{
+		Workers:            1,
+		RetryJitter:        0,
+		RetryMinDelay:      10 * time.Millisecond,
+		RetryMaxDelay:      20 * time.Millisecond,
+		DefaultJobTimeout:  40 * time.Millisecond,
+		RecentDuplicateTTL: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("new dispatcher: %v", err)
+	}
+
+	var active atomic.Int32
+	var maxActive atomic.Int32
+	err = d.RegisterHandler("slow-noncoop", func(_ context.Context, _ Job) error {
+		current := active.Add(1)
+		for {
+			observed := maxActive.Load()
+			if current <= observed {
+				break
+			}
+			if maxActive.CompareAndSwap(observed, current) {
+				break
+			}
+		}
+
+		time.Sleep(200 * time.Millisecond)
+		active.Add(-1)
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("register handler: %v", err)
+	}
+
+	if err = d.Start(); err != nil {
+		t.Fatalf("start dispatcher: %v", err)
+	}
+	if err = d.Submit(Job{ID: "overlap-1", Type: "slow-noncoop", MaxAttempts: 5}); err != nil {
+		t.Fatalf("submit overlap-1: %v", err)
+	}
+	if err = d.Submit(Job{ID: "overlap-2", Type: "slow-noncoop", MaxAttempts: 5}); err != nil {
+		t.Fatalf("submit overlap-2: %v", err)
+	}
+
+	waitForCondition(t, 3*time.Second, func() bool {
+		metrics := d.Metrics()
+		return metrics.Failed == 2
+	})
+
+	metrics := d.Metrics()
+	if metrics.Retried != 0 {
+		t.Fatalf("expected no retries for timeout jobs, got %d", metrics.Retried)
+	}
+	if maxActive.Load() > 1 {
+		t.Fatalf("expected non-overlapping non-cooperative handlers, max active=%d", maxActive.Load())
+	}
+
+	if err = d.Stop(context.Background()); err != nil {
+		t.Fatalf("stop dispatcher: %v", err)
+	}
+}
+
 func waitForCondition(t *testing.T, timeout time.Duration, condition func() bool) {
 	t.Helper()
 
