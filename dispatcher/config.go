@@ -25,6 +25,7 @@ type Config struct {
 	DefaultMaxAttempts int
 	DefaultJobTimeout  time.Duration
 	RecentDuplicateTTL time.Duration
+	Store              JobStore
 }
 
 func (c Config) normalize() (Config, error) {

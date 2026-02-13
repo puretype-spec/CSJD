@@ -44,6 +44,9 @@ func TestDispatcherSubmitBatchAndProcessAll(t *testing.T) {
 	if report.Duplicates != 0 || report.Invalid != 0 {
 		t.Fatalf("unexpected report: %+v", report)
 	}
+	if report.Errors != nil {
+		t.Fatalf("expected nil errors for all-accepted batch, got len=%d", len(report.Errors))
+	}
 
 	waitForCondition(t, 2*time.Second, func() bool {
 		return processed.Load() == int64(len(jobs))

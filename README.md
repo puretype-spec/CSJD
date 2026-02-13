@@ -10,6 +10,7 @@
 ## 功能清單
 - Worker pool (`Config.Workers`)
 - `Submit` / `SubmitBatch`（批次送入可降低 lock 開銷）
+- 可選單機持久化（`Config.Store` + `FileJobStore`）
 - Job retry（指數退避 + jitter）
 - Non-retriable error（`dispatcher.MarkPermanent(err)`）
 - Duplicate 保護（pending + in-flight + recent TTL window）
@@ -27,6 +28,7 @@
 - `dispatcher/types.go`：Job/Handler/Error/Metrics
 - `dispatcher/cache.go`：TTL cache + single-flight loader
 - `dispatcher/batch_loader.go`：批次載入器
+- `dispatcher/store.go`：持久化介面與 `FileJobStore`
 - `dispatcher/*_test.go`：單元測試
 - `dispatcher/dispatcher_benchmark_test.go`：效能基準測試
 - `cmd/demo/main.go`：最小可執行範例
@@ -74,6 +76,18 @@ func example() error {
     return d.Stop(stopCtx)
 }
 ```
+
+## 單機持久化（選配）
+```go
+store, _ := dispatcher.NewFileJobStore("./data/jobs.json")
+
+d, _ := dispatcher.New(dispatcher.Config{
+    Workers: 4,
+    Store:   store,
+})
+```
+- 行為：`Submit/SubmitBatch` 寫入 store，`Start()` 會載入未完成 job，`finish` 後刪除。
+- 用途：單機重啟後可恢復未完成工作（不是分散式調度）。
 
 ## 如何避免 N+1 / Cache / Async 問題
 
@@ -126,9 +140,10 @@ go test -run '^$' -bench BenchmarkDispatcherEndToEnd -benchmem ./dispatcher
 - `workers=1/4/8`：觀察 worker 擴展性
 - `ns/op`：每個 benchmark iteration（一個 batch）耗時
 - `B/op`、`allocs/op`：記憶體配置與 GC 壓力
+- 目前也包含 hot path 優化：`SubmitBatch` 採 lazy `Errors` 配置、scheduler 改成值回傳避免額外逃逸配置。
 
 ## 設計取捨與限制（Interview 可 defend）
-- 這是 in-process dispatcher，不做持久化；程序重啟後不保留未完成 job。
+- 這是 in-process dispatcher，預設記憶體模式；若需要重啟恢復可接 `FileJobStore` 做單機持久化。
 - 不含分散式排程與跨節點協調，不是 XXL-JOB 類完整平台替代品。
 - 對不配合 context 的 handler/fetch，Go 無法強制 kill goroutine，只能以 timeout + 隔離策略控風險。
 - `TTLCache` 單飛會共享同一個 in-flight load；每個 caller 可依自己的 context 提前返回，但背景 load 可能繼續到完成。

@@ -27,7 +27,8 @@ type metricsCounters struct {
 
 // Dispatcher is a concurrency-safe async job dispatcher.
 type Dispatcher struct {
-	cfg Config
+	cfg   Config
+	store JobStore
 
 	stateMu   sync.Mutex
 	handlerMu sync.RWMutex
@@ -69,6 +70,7 @@ func New(config Config) (*Dispatcher, error) {
 
 	d := &Dispatcher{
 		cfg:          cfg,
+		store:        resolveJobStore(cfg.Store),
 		handlers:     make(map[string]HandlerFunc),
 		pending:      make(scheduledJobHeap, 0),
 		pendingID:    make(map[string]struct{}),
@@ -114,12 +116,33 @@ func (d *Dispatcher) Start() error {
 		d.stateMu.Unlock()
 		return ErrDispatcherClosed
 	}
+	d.stateMu.Unlock()
 
+	recovered, err := d.loadPersistedJobs()
+	if err != nil {
+		return err
+	}
+
+	d.stateMu.Lock()
+	if d.started {
+		if d.closed {
+			d.stateMu.Unlock()
+			return ErrDispatcherClosed
+		}
+
+		d.stateMu.Unlock()
+		return nil
+	}
+	if d.closed {
+		d.stateMu.Unlock()
+		return ErrDispatcherClosed
+	}
 	d.runCtx, d.cancel = context.WithCancel(context.Background())
 	d.notifyCh = make(chan struct{}, 1)
 	d.readyCh = make(chan scheduledJob, d.cfg.ReadyQueueSize)
 	d.handlerSlots = newHandlerSlots(d.cfg.Workers)
 	d.lastRecentCleanup = time.Time{}
+	d.restorePersistedJobsLocked(recovered, time.Now())
 	d.started = true
 	workers := d.cfg.Workers
 	d.stateMu.Unlock()
@@ -198,10 +221,16 @@ func (d *Dispatcher) Submit(job Job) error {
 	if job.CreatedAt.IsZero() {
 		job.CreatedAt = now
 	}
-	job.Payload = cloneBytes(job.Payload)
+	job = cloneJob(job)
+	item := scheduledJob{job: job, attempt: 1, runAt: now}
+
+	if err = d.persistScheduledJob(item); err != nil {
+		d.stateMu.Unlock()
+		return err
+	}
 
 	d.inFlight[job.ID] = struct{}{}
-	heap.Push(&d.pending, scheduledJob{job: job, attempt: 1, runAt: now})
+	heap.Push(&d.pending, item)
 	d.pendingID[job.ID] = struct{}{}
 	d.stateMu.Unlock()
 
@@ -213,9 +242,16 @@ func (d *Dispatcher) Submit(job Job) error {
 
 // SubmitBatch enqueues jobs with one lock acquisition to reduce ingestion overhead.
 func (d *Dispatcher) SubmitBatch(jobs []Job) BatchSubmitReport {
-	report := BatchSubmitReport{Errors: make([]error, len(jobs))}
+	report := BatchSubmitReport{}
 	if len(jobs) == 0 {
 		return report
+	}
+
+	setError := func(index int, err error) {
+		if report.Errors == nil {
+			report.Errors = make([]error, len(jobs))
+		}
+		report.Errors[index] = err
 	}
 
 	d.metrics.submitted.Add(uint64(len(jobs)))
@@ -224,7 +260,8 @@ func (d *Dispatcher) SubmitBatch(jobs []Job) BatchSubmitReport {
 	d.stateMu.Lock()
 	if !d.started {
 		d.stateMu.Unlock()
-		for i := range report.Errors {
+		report.Errors = make([]error, len(jobs))
+		for i := range jobs {
 			report.Errors[i] = ErrDispatcherNotStarted
 		}
 
@@ -232,7 +269,8 @@ func (d *Dispatcher) SubmitBatch(jobs []Job) BatchSubmitReport {
 	}
 	if d.closed {
 		d.stateMu.Unlock()
-		for i := range report.Errors {
+		report.Errors = make([]error, len(jobs))
+		for i := range jobs {
 			report.Errors[i] = ErrDispatcherClosed
 		}
 
@@ -243,13 +281,13 @@ func (d *Dispatcher) SubmitBatch(jobs []Job) BatchSubmitReport {
 		validationErr := job.validate()
 		if validationErr != nil {
 			report.Invalid++
-			report.Errors[i] = validationErr
+			setError(i, validationErr)
 			continue
 		}
 
 		if d.isDuplicateLocked(job.ID, now) {
 			report.Duplicates++
-			report.Errors[i] = ErrDuplicateJob
+			setError(i, ErrDuplicateJob)
 			d.metrics.duplicates.Add(1)
 			continue
 		}
@@ -257,10 +295,16 @@ func (d *Dispatcher) SubmitBatch(jobs []Job) BatchSubmitReport {
 		if job.CreatedAt.IsZero() {
 			job.CreatedAt = now
 		}
-		job.Payload = cloneBytes(job.Payload)
+		job = cloneJob(job)
+		item := scheduledJob{job: job, attempt: 1, runAt: now}
+		saveErr := d.persistScheduledJob(item)
+		if saveErr != nil {
+			setError(i, saveErr)
+			continue
+		}
 
 		d.inFlight[job.ID] = struct{}{}
-		heap.Push(&d.pending, scheduledJob{job: job, attempt: 1, runAt: now})
+		heap.Push(&d.pending, item)
 		d.pendingID[job.ID] = struct{}{}
 		report.Accepted++
 		d.metrics.accepted.Add(1)
@@ -293,14 +337,14 @@ func (d *Dispatcher) schedulerLoop() {
 	defer close(d.readyCh)
 
 	for {
-		job, wait, shouldStop := d.nextDueJob()
+		job, hasJob, wait, shouldStop := d.nextDueJob()
 		if shouldStop {
 			return
 		}
 
-		if job != nil {
+		if hasJob {
 			select {
-			case d.readyCh <- *job:
+			case d.readyCh <- job:
 			case <-d.runCtx.Done():
 				return
 			}
@@ -340,7 +384,7 @@ func (d *Dispatcher) schedulerLoop() {
 	}
 }
 
-func (d *Dispatcher) nextDueJob() (*scheduledJob, time.Duration, bool) {
+func (d *Dispatcher) nextDueJob() (scheduledJob, bool, time.Duration, bool) {
 	d.stateMu.Lock()
 	defer d.stateMu.Unlock()
 
@@ -348,26 +392,26 @@ func (d *Dispatcher) nextDueJob() (*scheduledJob, time.Duration, bool) {
 	d.cleanupRecentIfDueLocked(now)
 
 	if d.closed && len(d.pending) == 0 && len(d.inFlight) == 0 {
-		return nil, 0, true
+		return scheduledJob{}, false, 0, true
 	}
 
 	if len(d.pending) == 0 {
-		return nil, -1, false
+		return scheduledJob{}, false, -1, false
 	}
 
 	head := d.pending[0]
 	if head.runAt.After(now) {
-		return nil, head.runAt.Sub(now), false
+		return scheduledJob{}, false, head.runAt.Sub(now), false
 	}
 
 	nextValue := heap.Pop(&d.pending)
 	next, ok := nextValue.(scheduledJob)
 	if !ok {
-		return nil, -1, false
+		return scheduledJob{}, false, -1, false
 	}
 	delete(d.pendingID, next.job.ID)
 
-	return &next, 0, false
+	return next, true, 0, false
 }
 
 func (d *Dispatcher) workerLoop() {
@@ -389,7 +433,9 @@ func (d *Dispatcher) workerLoop() {
 		}
 
 		d.metrics.retried.Add(1)
-		d.reschedule(job)
+		if rescheduleErr := d.reschedule(job); rescheduleErr != nil {
+			d.finishJob(job.job.ID, false)
+		}
 	}
 }
 
@@ -464,21 +510,29 @@ func (d *Dispatcher) execute(item scheduledJob) error {
 	}
 }
 
-func (d *Dispatcher) reschedule(item scheduledJob) {
+func (d *Dispatcher) reschedule(item scheduledJob) error {
 	delay := d.computeRetryDelay(item.attempt)
 	runAt := time.Now().Add(delay)
+	next := scheduledJob{job: item.job, attempt: item.attempt + 1, runAt: runAt}
 
 	d.stateMu.Lock()
 	if d.closed {
 		d.stateMu.Unlock()
 		d.finishJob(item.job.ID, false)
-		return
+		return nil
 	}
 
-	heap.Push(&d.pending, scheduledJob{job: item.job, attempt: item.attempt + 1, runAt: runAt})
+	if err := d.persistScheduledJob(next); err != nil {
+		d.stateMu.Unlock()
+		return err
+	}
+
+	heap.Push(&d.pending, next)
 	d.pendingID[item.job.ID] = struct{}{}
 	d.stateMu.Unlock()
 	d.notify()
+
+	return nil
 }
 
 func (d *Dispatcher) finishJob(jobID string, success bool) {
@@ -487,6 +541,7 @@ func (d *Dispatcher) finishJob(jobID string, success bool) {
 	delete(d.inFlight, jobID)
 	d.recent.add(jobID, now)
 	d.stateMu.Unlock()
+	_ = d.store.Delete(jobID)
 
 	if success {
 		d.metrics.succeeded.Add(1)
@@ -601,6 +656,56 @@ func cloneBytes(value []byte) []byte {
 	copy(copied, value)
 
 	return copied
+}
+
+func resolveJobStore(store JobStore) JobStore {
+	if store == nil {
+		return noopJobStore{}
+	}
+
+	return store
+}
+
+func (d *Dispatcher) persistScheduledJob(item scheduledJob) error {
+	err := d.store.Save(PersistedJob{
+		Job:     item.job,
+		Attempt: item.attempt,
+		RunAt:   item.runAt,
+	})
+	if err != nil {
+		return fmt.Errorf("persist job %s: %w", item.job.ID, err)
+	}
+
+	return nil
+}
+
+func (d *Dispatcher) loadPersistedJobs() ([]PersistedJob, error) {
+	items, err := d.store.Load()
+	if err != nil {
+		return nil, fmt.Errorf("load persisted jobs: %w", err)
+	}
+
+	return items, nil
+}
+
+func (d *Dispatcher) restorePersistedJobsLocked(items []PersistedJob, now time.Time) {
+	for _, persisted := range items {
+		normalized, err := normalizePersistedJob(persisted, now)
+		if err != nil {
+			continue
+		}
+		if d.isDuplicateLocked(normalized.Job.ID, now) {
+			continue
+		}
+
+		d.inFlight[normalized.Job.ID] = struct{}{}
+		heap.Push(&d.pending, scheduledJob{
+			job:     normalized.Job,
+			attempt: normalized.Attempt,
+			runAt:   normalized.RunAt,
+		})
+		d.pendingID[normalized.Job.ID] = struct{}{}
+	}
 }
 
 func (d *Dispatcher) acquireHandlerSlot(ctx context.Context, slots chan struct{}) error {
