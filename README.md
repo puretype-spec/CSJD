@@ -18,6 +18,8 @@
 - Metrics snapshot
 - `TTLCache`（stampede 防護，`GetOrLoad` 單飛）
 - `BatchLoader` 合併並行請求
+- Benchmark（可比較 worker 規模下的端到端吞吐）
+- 結構化日誌示例（`slog` + metrics tags）
 
 ## 專案結構
 - `dispatcher/dispatcher.go`：dispatcher 核心流程
@@ -26,12 +28,14 @@
 - `dispatcher/cache.go`：TTL cache + single-flight loader
 - `dispatcher/batch_loader.go`：批次載入器
 - `dispatcher/*_test.go`：單元測試
+- `dispatcher/dispatcher_benchmark_test.go`：效能基準測試
 - `cmd/demo/main.go`：最小可執行範例
 
 ## 快速開始
 ```bash
 go test ./...
 go run ./cmd/demo
+go test -run '^$' -bench BenchmarkDispatcherEndToEnd -benchmem ./dispatcher
 ```
 
 ## 使用範例
@@ -110,3 +114,29 @@ profile, err := cache.GetOrLoad(ctx, "u-1", loadProfile)
 - Stop 後重啟與 timeout 後最終重啟
 - Cache 單飛與 TTL 過期
 - Batch loader 併批與關閉行為
+
+## Benchmark（面試展示版）
+- Benchmark 檔案：`dispatcher/dispatcher_benchmark_test.go`
+- 目的：比較不同 `Workers` 設定下，`SubmitBatch` 到 handler 完成的端到端吞吐。
+- 指令：
+```bash
+go test -run '^$' -bench BenchmarkDispatcherEndToEnd -benchmem ./dispatcher
+```
+- 讀法：
+- `workers=1/4/8`：觀察 worker 擴展性
+- `ns/op`：每個 benchmark iteration（一個 batch）耗時
+- `B/op`、`allocs/op`：記憶體配置與 GC 壓力
+
+## 設計取捨與限制（Interview 可 defend）
+- 這是 in-process dispatcher，不做持久化；程序重啟後不保留未完成 job。
+- 不含分散式排程與跨節點協調，不是 XXL-JOB 類完整平台替代品。
+- 對不配合 context 的 handler/fetch，Go 無法強制 kill goroutine，只能以 timeout + 隔離策略控風險。
+- `TTLCache` 單飛會共享同一個 in-flight load；每個 caller 可依自己的 context 提前返回，但背景 load 可能繼續到完成。
+- 設計優先順序是簡潔、可測試、可讀與單服務可落地，而非重型分散式特性。
+
+## 可觀測性示例（structured log + metrics tags）
+- `cmd/demo/main.go` 已示範 `slog` JSON 日誌，包含可篩選欄位：
+- `component`、`job_id`、`job_type`、`payload_size`
+- 關機後輸出 dispatcher metrics 標籤：
+- `submitted`、`accepted`、`processed`、`retried`、`succeeded`、`failed`、`panics`
+- 實務上可直接把這些欄位導入 ELK/Loki/Cloud Logging，或轉成 Prometheus 指標維度。

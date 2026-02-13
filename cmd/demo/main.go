@@ -2,14 +2,16 @@ package main
 
 import (
 	"context"
-	"fmt"
-	"log"
+	"log/slog"
+	"os"
 	"time"
 
 	"csjd/dispatcher"
 )
 
 func main() {
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+
 	d, err := dispatcher.New(dispatcher.Config{
 		Workers:            4,
 		RetryMinDelay:      100 * time.Millisecond,
@@ -19,19 +21,29 @@ func main() {
 		RecentDuplicateTTL: 2 * time.Second,
 	})
 	if err != nil {
-		log.Fatalf("new dispatcher: %v", err)
+		logger.Error("new dispatcher failed", "component", "bootstrap", "error", err)
+		os.Exit(1)
 	}
 
 	err = d.RegisterHandler("print", func(_ context.Context, job dispatcher.Job) error {
-		fmt.Printf("[worker] job=%s type=%s payload=%s\n", job.ID, job.Type, string(job.Payload))
+		logger.Info(
+			"job handled",
+			"component", "worker",
+			"job_id", job.ID,
+			"job_type", job.Type,
+			"payload_size", len(job.Payload),
+		)
+
 		return nil
 	})
 	if err != nil {
-		log.Fatalf("register handler: %v", err)
+		logger.Error("register handler failed", "component", "bootstrap", "job_type", "print", "error", err)
+		os.Exit(1)
 	}
 
 	if err = d.Start(); err != nil {
-		log.Fatalf("start dispatcher: %v", err)
+		logger.Error("start dispatcher failed", "component", "bootstrap", "error", err)
+		os.Exit(1)
 	}
 
 	jobs := []dispatcher.Job{
@@ -40,17 +52,33 @@ func main() {
 		{ID: "demo-3", Type: "print", Payload: []byte("job dispatcher")},
 	}
 	report := d.SubmitBatch(jobs)
-	if report.Accepted != len(jobs) {
-		log.Printf("batch report: %+v", report)
-	}
+	logger.Info(
+		"submit batch result",
+		"component", "ingest",
+		"accepted", report.Accepted,
+		"duplicates", report.Duplicates,
+		"invalid", report.Invalid,
+	)
 
 	time.Sleep(300 * time.Millisecond)
 
 	stopCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	if err = d.Stop(stopCtx); err != nil {
-		log.Fatalf("stop dispatcher: %v", err)
+		logger.Error("stop dispatcher failed", "component", "shutdown", "error", err)
+		os.Exit(1)
 	}
 
-	fmt.Printf("metrics: %s\n", d.Metrics().String())
+	metrics := d.Metrics()
+	logger.Info(
+		"dispatcher metrics",
+		"component", "metrics",
+		"submitted", metrics.Submitted,
+		"accepted", metrics.Accepted,
+		"processed", metrics.Processed,
+		"retried", metrics.Retried,
+		"succeeded", metrics.Succeeded,
+		"failed", metrics.Failed,
+		"panics", metrics.Panics,
+	)
 }
