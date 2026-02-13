@@ -216,6 +216,55 @@ func TestBatchLoaderCloseReturnsWhenFetchIgnoresContext(t *testing.T) {
 	}
 }
 
+func TestBatchLoaderLoadAfterCloseDoesNotQueueRequest(t *testing.T) {
+	started := make(chan struct{}, 1)
+	releaseFetch := make(chan struct{})
+
+	loader, err := NewBatchLoader[int, int](BatchLoaderConfig{MaxBatch: 1, MaxWait: 5 * time.Millisecond}, func(_ context.Context, _ []int) (map[int]int, error) {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+
+		<-releaseFetch
+		return map[int]int{1: 1}, nil
+	})
+	if err != nil {
+		t.Fatalf("new batch loader: %v", err)
+	}
+
+	go func() {
+		_, _ = loader.Load(context.Background(), 1)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("fetch was not started")
+	}
+
+	loader.Close()
+
+	for i := 0; i < 20; i++ {
+		_, loadErr := loader.Load(context.Background(), i+2)
+		if !errors.Is(loadErr, ErrBatchLoaderClosed) {
+			t.Fatalf("expected ErrBatchLoaderClosed, got %v", loadErr)
+		}
+	}
+
+	if len(loader.reqCh) != 0 {
+		t.Fatalf("expected closed loader to not queue requests, queued=%d", len(loader.reqCh))
+	}
+
+	close(releaseFetch)
+
+	select {
+	case <-loader.runDone:
+	case <-time.After(time.Second):
+		t.Fatal("run loop did not stop after fetch was released")
+	}
+}
+
 func TestBatchLoaderFetchPanicReturnsErrorAndKeepsLoopAlive(t *testing.T) {
 	var calls atomic.Int32
 	loader, err := NewBatchLoader[int, int](BatchLoaderConfig{MaxBatch: 1, MaxWait: 5 * time.Millisecond}, func(_ context.Context, keys []int) (map[int]int, error) {

@@ -537,6 +537,71 @@ func TestDispatcherTimeoutDoesNotCreateOverlappingHandlerExecutions(t *testing.T
 	}
 }
 
+func TestDispatcherRestartDoesNotInheritStuckHandlerSlot(t *testing.T) {
+	d, err := New(Config{
+		Workers:            1,
+		RetryJitter:        0,
+		DefaultJobTimeout:  40 * time.Millisecond,
+		RecentDuplicateTTL: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("new dispatcher: %v", err)
+	}
+
+	releaseSlow := make(chan struct{})
+	var fastCalls atomic.Int32
+
+	err = d.RegisterHandler("slow-stuck", func(_ context.Context, _ Job) error {
+		<-releaseSlow
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("register slow handler: %v", err)
+	}
+
+	err = d.RegisterHandler("fast", func(_ context.Context, _ Job) error {
+		fastCalls.Add(1)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("register fast handler: %v", err)
+	}
+
+	if err = d.Start(); err != nil {
+		t.Fatalf("start first run: %v", err)
+	}
+
+	if err = d.Submit(Job{ID: "slot-1", Type: "slow-stuck", MaxAttempts: 1}); err != nil {
+		t.Fatalf("submit slow job: %v", err)
+	}
+
+	waitForCondition(t, 2*time.Second, func() bool {
+		return d.Metrics().Failed == 1
+	})
+
+	if err = d.Stop(context.Background()); err != nil {
+		t.Fatalf("stop first run: %v", err)
+	}
+
+	if err = d.Start(); err != nil {
+		t.Fatalf("start second run: %v", err)
+	}
+
+	if err = d.Submit(Job{ID: "slot-2", Type: "fast", MaxAttempts: 1}); err != nil {
+		t.Fatalf("submit fast job: %v", err)
+	}
+
+	waitForCondition(t, 2*time.Second, func() bool {
+		return fastCalls.Load() == 1
+	})
+
+	close(releaseSlow)
+
+	if err = d.Stop(context.Background()); err != nil {
+		t.Fatalf("stop second run: %v", err)
+	}
+}
+
 func waitForCondition(t *testing.T, timeout time.Duration, condition func() bool) {
 	t.Helper()
 

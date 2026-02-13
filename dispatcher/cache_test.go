@@ -162,3 +162,66 @@ func TestTTLCacheGetOrLoadLoaderPanicUnblocksWaiters(t *testing.T) {
 		t.Fatal("waiter did not finish")
 	}
 }
+
+func TestTTLCacheGetOrLoadNotTiedToLeaderContextCancellation(t *testing.T) {
+	cache := NewTTLCache[string, int](time.Second)
+
+	leaderCtx, cancelLeader := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancelLeader()
+
+	leaderStarted := make(chan struct{})
+	leaderDone := make(chan error, 1)
+	go func() {
+		_, err := cache.GetOrLoad(leaderCtx, "k", func(ctx context.Context, _ string) (int, error) {
+			close(leaderStarted)
+			select {
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			case <-time.After(60 * time.Millisecond):
+				return 42, nil
+			}
+		})
+		leaderDone <- err
+	}()
+
+	select {
+	case <-leaderStarted:
+	case <-time.After(time.Second):
+		t.Fatal("leader loader was not started")
+	}
+
+	followerDone := make(chan struct {
+		value int
+		err   error
+	}, 1)
+	go func() {
+		value, err := cache.GetOrLoad(context.Background(), "k", func(_ context.Context, _ string) (int, error) {
+			return 7, nil
+		})
+		followerDone <- struct {
+			value int
+			err   error
+		}{value: value, err: err}
+	}()
+
+	select {
+	case result := <-followerDone:
+		if result.err != nil {
+			t.Fatalf("follower should not fail due to leader timeout: %v", result.err)
+		}
+		if result.value != 42 {
+			t.Fatalf("follower value mismatch: got %d", result.value)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("follower did not finish")
+	}
+
+	select {
+	case err := <-leaderDone:
+		if err != nil {
+			t.Fatalf("leader should complete with shared result, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("leader did not finish")
+	}
+}

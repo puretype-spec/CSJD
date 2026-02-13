@@ -18,6 +18,7 @@ var (
 const (
 	defaultBatchSize = 64
 	defaultBatchWait = 5 * time.Millisecond
+	enqueueWaitStep  = 1 * time.Millisecond
 )
 
 // BatchFetchFunc fetches values for keys in one call.
@@ -71,6 +72,8 @@ type BatchLoader[K comparable, V any] struct {
 	runCancel context.CancelFunc
 	runDone   chan struct{}
 	closeOnce sync.Once
+	closeMu   sync.RWMutex
+	closed    bool
 }
 
 // NewBatchLoader starts a batching loop.
@@ -109,14 +112,10 @@ func (l *BatchLoader[K, V]) Load(ctx context.Context, key K) (V, error) {
 	replyCh := make(chan batchReply[V], 1)
 	request := batchRequest[K, V]{ctx: ctx, key: key, reply: replyCh}
 
-	select {
-	case <-l.stopCh:
+	err := l.enqueueRequest(ctx, request)
+	if err != nil {
 		var zero V
-		return zero, ErrBatchLoaderClosed
-	case <-ctx.Done():
-		var zero V
-		return zero, ctx.Err()
-	case l.reqCh <- request:
+		return zero, err
 	}
 
 	select {
@@ -135,11 +134,14 @@ func (l *BatchLoader[K, V]) Load(ctx context.Context, key K) (V, error) {
 // It does not wait for fetch to return because fetch may ignore cancellation.
 func (l *BatchLoader[K, V]) Close() {
 	l.closeOnce.Do(func() {
+		l.closeMu.Lock()
+		l.closed = true
 		close(l.stopCh)
 
 		if l.runCancel != nil {
 			l.runCancel()
 		}
+		l.closeMu.Unlock()
 
 		// Best effort: unblock queued requests even when fetch is non-cooperative.
 		l.rejectQueuedRequests(ErrBatchLoaderClosed)
@@ -285,10 +287,39 @@ func (l *BatchLoader[K, V]) respondOne(request batchRequest[K, V], reply batchRe
 }
 
 func (l *BatchLoader[K, V]) isClosed() bool {
-	select {
-	case <-l.stopCh:
-		return true
-	default:
-		return false
+	l.closeMu.RLock()
+	closed := l.closed
+	l.closeMu.RUnlock()
+
+	return closed
+}
+
+func (l *BatchLoader[K, V]) enqueueRequest(ctx context.Context, request batchRequest[K, V]) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		l.closeMu.RLock()
+		if l.closed {
+			l.closeMu.RUnlock()
+			return ErrBatchLoaderClosed
+		}
+
+		select {
+		case l.reqCh <- request:
+			l.closeMu.RUnlock()
+			return nil
+		default:
+			l.closeMu.RUnlock()
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-l.stopCh:
+			return ErrBatchLoaderClosed
+		case <-time.After(enqueueWaitStep):
+		}
 	}
 }

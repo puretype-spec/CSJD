@@ -68,21 +68,14 @@ func New(config Config) (*Dispatcher, error) {
 	}
 
 	d := &Dispatcher{
-		cfg:         cfg,
-		handlers:    make(map[string]HandlerFunc),
-		pending:     make(scheduledJobHeap, 0),
-		pendingID:   make(map[string]struct{}),
-		inFlight:    make(map[string]struct{}),
-		recent:      newTTLSet(cfg.RecentDuplicateTTL),
-		backoffRand: rand.New(rand.NewSource(time.Now().UnixNano())),
-		handlerSlots: func() chan struct{} {
-			slots := make(chan struct{}, cfg.Workers)
-			for i := 0; i < cfg.Workers; i++ {
-				slots <- struct{}{}
-			}
-
-			return slots
-		}(),
+		cfg:          cfg,
+		handlers:     make(map[string]HandlerFunc),
+		pending:      make(scheduledJobHeap, 0),
+		pendingID:    make(map[string]struct{}),
+		inFlight:     make(map[string]struct{}),
+		recent:       newTTLSet(cfg.RecentDuplicateTTL),
+		backoffRand:  rand.New(rand.NewSource(time.Now().UnixNano())),
+		handlerSlots: newHandlerSlots(cfg.Workers),
 	}
 	heap.Init(&d.pending)
 
@@ -125,6 +118,7 @@ func (d *Dispatcher) Start() error {
 	d.runCtx, d.cancel = context.WithCancel(context.Background())
 	d.notifyCh = make(chan struct{}, 1)
 	d.readyCh = make(chan scheduledJob, d.cfg.ReadyQueueSize)
+	d.handlerSlots = newHandlerSlots(d.cfg.Workers)
 	d.lastRecentCleanup = time.Time{}
 	d.started = true
 	workers := d.cfg.Workers
@@ -408,8 +402,9 @@ func (d *Dispatcher) execute(item scheduledJob) error {
 	jobTimeout := item.job.effectiveTimeout(d.cfg.DefaultJobTimeout)
 	jobCtx, cancel := context.WithTimeout(d.runCtx, jobTimeout)
 	defer cancel()
+	handlerSlots := d.handlerSlots
 
-	acquireErr := d.acquireHandlerSlot(jobCtx)
+	acquireErr := d.acquireHandlerSlot(jobCtx, handlerSlots)
 	if acquireErr != nil {
 		if errors.Is(acquireErr, context.DeadlineExceeded) {
 			return MarkPermanent(acquireErr)
@@ -426,7 +421,7 @@ func (d *Dispatcher) execute(item scheduledJob) error {
 
 	handlerErrCh := make(chan error, 1)
 	go func() {
-		defer d.releaseHandlerSlot()
+		defer d.releaseHandlerSlot(handlerSlots)
 		defer func() {
 			recovered := recover()
 			if recovered == nil {
@@ -608,20 +603,29 @@ func cloneBytes(value []byte) []byte {
 	return copied
 }
 
-func (d *Dispatcher) acquireHandlerSlot(ctx context.Context) error {
+func (d *Dispatcher) acquireHandlerSlot(ctx context.Context, slots chan struct{}) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-d.runCtx.Done():
 		return d.runCtx.Err()
-	case <-d.handlerSlots:
+	case <-slots:
 		return nil
 	}
 }
 
-func (d *Dispatcher) releaseHandlerSlot() {
+func (d *Dispatcher) releaseHandlerSlot(slots chan struct{}) {
 	select {
-	case d.handlerSlots <- struct{}{}:
+	case slots <- struct{}{}:
 	default:
 	}
+}
+
+func newHandlerSlots(workers int) chan struct{} {
+	slots := make(chan struct{}, workers)
+	for i := 0; i < workers; i++ {
+		slots <- struct{}{}
+	}
+
+	return slots
 }

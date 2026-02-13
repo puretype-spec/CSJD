@@ -163,7 +163,8 @@ func (c *TTLCache[K, V]) GetOrLoad(ctx context.Context, key K, loader func(conte
 			err = fmt.Errorf("cache loader panic: %v", recovered)
 		}()
 
-		value, err = loader(ctx, key)
+		// Decouple in-flight loading from the first caller cancellation.
+		value, err = loader(context.WithoutCancel(ctx), key)
 	}()
 
 	c.mu.Lock()
