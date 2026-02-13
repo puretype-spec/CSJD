@@ -19,6 +19,7 @@ const (
 )
 
 // BatchFetchFunc fetches values for keys in one call.
+// Implementations should respect ctx cancellation for fast shutdown.
 type BatchFetchFunc[K comparable, V any] func(ctx context.Context, keys []K) (map[K]V, error)
 
 // BatchLoaderConfig controls batching behavior.
@@ -64,7 +65,9 @@ type BatchLoader[K comparable, V any] struct {
 	reqCh  chan batchRequest[K, V]
 	stopCh chan struct{}
 
-	runDone chan struct{}
+	runCtx    context.Context
+	runCancel context.CancelFunc
+	runDone   chan struct{}
 }
 
 // NewBatchLoader starts a batching loop.
@@ -78,12 +81,15 @@ func NewBatchLoader[K comparable, V any](cfg BatchLoaderConfig, fetch BatchFetch
 		return nil, err
 	}
 
+	runCtx, runCancel := context.WithCancel(context.Background())
 	loader := &BatchLoader[K, V]{
-		cfg:     normalized,
-		fetch:   fetch,
-		reqCh:   make(chan batchRequest[K, V], normalized.MaxBatch*4),
-		stopCh:  make(chan struct{}),
-		runDone: make(chan struct{}),
+		cfg:       normalized,
+		fetch:     fetch,
+		reqCh:     make(chan batchRequest[K, V], normalized.MaxBatch*4),
+		stopCh:    make(chan struct{}),
+		runCtx:    runCtx,
+		runCancel: runCancel,
+		runDone:   make(chan struct{}),
 	}
 
 	go loader.run()
@@ -129,6 +135,10 @@ func (l *BatchLoader[K, V]) Close() {
 		return
 	default:
 		close(l.stopCh)
+	}
+
+	if l.runCancel != nil {
+		l.runCancel()
 	}
 
 	<-l.runDone
@@ -199,8 +209,13 @@ dispatch:
 		return true
 	}
 
-	results, err := l.fetch(context.Background(), keys)
+	results, err := l.fetch(l.runCtx, keys)
 	if err != nil {
+		if errors.Is(err, context.Canceled) && l.isClosed() {
+			l.respondMap(activeKeys, batchReply[V]{err: ErrBatchLoaderClosed})
+			return false
+		}
+
 		l.respondMap(activeKeys, batchReply[V]{err: err})
 		return true
 	}
@@ -251,5 +266,14 @@ func (l *BatchLoader[K, V]) respondOne(request batchRequest[K, V], reply batchRe
 	select {
 	case request.reply <- reply:
 	default:
+	}
+}
+
+func (l *BatchLoader[K, V]) isClosed() bool {
+	select {
+	case <-l.stopCh:
+		return true
+	default:
+		return false
 	}
 }

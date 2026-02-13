@@ -114,3 +114,49 @@ func TestBatchLoaderClose(t *testing.T) {
 		t.Fatalf("expected ErrBatchLoaderClosed, got %v", err)
 	}
 }
+
+func TestBatchLoaderCloseCancelsInFlightFetch(t *testing.T) {
+	started := make(chan struct{})
+
+	loader, err := NewBatchLoader[int, int](BatchLoaderConfig{MaxBatch: 1, MaxWait: 5 * time.Millisecond}, func(ctx context.Context, _ []int) (map[int]int, error) {
+		close(started)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	if err != nil {
+		t.Fatalf("new batch loader: %v", err)
+	}
+
+	loadDone := make(chan error, 1)
+	go func() {
+		_, loadErr := loader.Load(context.Background(), 42)
+		loadDone <- loadErr
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("fetch was not started")
+	}
+
+	closeDone := make(chan struct{})
+	go func() {
+		loader.Close()
+		close(closeDone)
+	}()
+
+	select {
+	case <-closeDone:
+	case <-time.After(time.Second):
+		t.Fatal("loader.Close() timed out")
+	}
+
+	select {
+	case loadErr := <-loadDone:
+		if !errors.Is(loadErr, ErrBatchLoaderClosed) {
+			t.Fatalf("expected ErrBatchLoaderClosed, got %v", loadErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("load call did not return")
+	}
+}
