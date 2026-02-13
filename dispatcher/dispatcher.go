@@ -23,6 +23,7 @@ type metricsCounters struct {
 	succeeded  atomic.Uint64
 	failed     atomic.Uint64
 	panics     atomic.Uint64
+	detached   atomic.Uint64
 }
 
 // Dispatcher is a concurrency-safe async job dispatcher.
@@ -59,6 +60,8 @@ type Dispatcher struct {
 	metrics metricsCounters
 
 	handlerSlots chan struct{}
+
+	detachedInFlight atomic.Int32
 }
 
 // New creates a dispatcher with validated configuration.
@@ -70,7 +73,7 @@ func New(config Config) (*Dispatcher, error) {
 
 	d := &Dispatcher{
 		cfg:          cfg,
-		store:        resolveJobStore(cfg.Store),
+		store:        cfg.Store,
 		handlers:     make(map[string]HandlerFunc),
 		pending:      make(scheduledJobHeap, 0),
 		pendingID:    make(map[string]struct{}),
@@ -218,6 +221,10 @@ func (d *Dispatcher) Submit(job Job) error {
 		d.metrics.duplicates.Add(1)
 		return ErrDuplicateJob
 	}
+	if d.isQueueFullLocked() {
+		d.stateMu.Unlock()
+		return ErrQueueFull
+	}
 	if job.CreatedAt.IsZero() {
 		job.CreatedAt = now
 	}
@@ -291,6 +298,10 @@ func (d *Dispatcher) SubmitBatch(jobs []Job) BatchSubmitReport {
 			d.metrics.duplicates.Add(1)
 			continue
 		}
+		if d.isQueueFullLocked() {
+			setError(i, ErrQueueFull)
+			continue
+		}
 
 		if job.CreatedAt.IsZero() {
 			job.CreatedAt = now
@@ -329,6 +340,7 @@ func (d *Dispatcher) Metrics() MetricsSnapshot {
 		Succeeded:  d.metrics.succeeded.Load(),
 		Failed:     d.metrics.failed.Load(),
 		Panics:     d.metrics.panics.Load(),
+		Detached:   d.metrics.detached.Load(),
 	}
 }
 
@@ -465,9 +477,17 @@ func (d *Dispatcher) execute(item scheduledJob) error {
 		return acquireErr
 	}
 
+	lease := newHandlerSlotLease(handlerSlots, d.releaseHandlerSlot)
+	var detached atomic.Bool
+
 	handlerErrCh := make(chan error, 1)
 	go func() {
-		defer d.releaseHandlerSlot(handlerSlots)
+		defer lease.Release()
+		defer func() {
+			if detached.Load() {
+				d.detachedInFlight.Add(-1)
+			}
+		}()
 		defer func() {
 			recovered := recover()
 			if recovered == nil {
@@ -497,6 +517,9 @@ func (d *Dispatcher) execute(item scheduledJob) error {
 	case <-jobCtx.Done():
 		handlerErr := jobCtx.Err()
 		if errors.Is(handlerErr, context.DeadlineExceeded) {
+			if d.tryDetachTimedOutHandler(&detached) {
+				lease.Release()
+			}
 			return MarkPermanent(handlerErr)
 		}
 
@@ -541,7 +564,9 @@ func (d *Dispatcher) finishJob(jobID string, success bool) {
 	delete(d.inFlight, jobID)
 	d.recent.add(jobID, now)
 	d.stateMu.Unlock()
-	_ = d.store.Delete(jobID)
+	if d.store != nil {
+		_ = d.store.Delete(jobID)
+	}
 
 	if success {
 		d.metrics.succeeded.Add(1)
@@ -572,6 +597,10 @@ func (d *Dispatcher) isDuplicateLocked(jobID string, now time.Time) bool {
 	}
 
 	return false
+}
+
+func (d *Dispatcher) isQueueFullLocked() bool {
+	return d.cfg.MaxPendingJobs > 0 && len(d.inFlight) >= d.cfg.MaxPendingJobs
 }
 
 func (d *Dispatcher) notify() {
@@ -658,15 +687,11 @@ func cloneBytes(value []byte) []byte {
 	return copied
 }
 
-func resolveJobStore(store JobStore) JobStore {
-	if store == nil {
-		return noopJobStore{}
+func (d *Dispatcher) persistScheduledJob(item scheduledJob) error {
+	if d.store == nil {
+		return nil
 	}
 
-	return store
-}
-
-func (d *Dispatcher) persistScheduledJob(item scheduledJob) error {
 	err := d.store.Save(PersistedJob{
 		Job:     item.job,
 		Attempt: item.attempt,
@@ -680,6 +705,10 @@ func (d *Dispatcher) persistScheduledJob(item scheduledJob) error {
 }
 
 func (d *Dispatcher) loadPersistedJobs() ([]PersistedJob, error) {
+	if d.store == nil {
+		return nil, nil
+	}
+
 	items, err := d.store.Load()
 	if err != nil {
 		return nil, fmt.Errorf("load persisted jobs: %w", err)
@@ -724,6 +753,44 @@ func (d *Dispatcher) releaseHandlerSlot(slots chan struct{}) {
 	case slots <- struct{}{}:
 	default:
 	}
+}
+
+func (d *Dispatcher) tryDetachTimedOutHandler(detached *atomic.Bool) bool {
+	limit := d.cfg.MaxDetachedHandlers
+	if limit <= 0 {
+		return false
+	}
+
+	for {
+		current := d.detachedInFlight.Load()
+		if int(current) >= limit {
+			return false
+		}
+		if d.detachedInFlight.CompareAndSwap(current, current+1) {
+			detached.Store(true)
+			d.metrics.detached.Add(1)
+			return true
+		}
+	}
+}
+
+type handlerSlotLease struct {
+	slots     chan struct{}
+	releaseFn func(chan struct{})
+	once      sync.Once
+}
+
+func newHandlerSlotLease(slots chan struct{}, releaseFn func(chan struct{})) *handlerSlotLease {
+	return &handlerSlotLease{
+		slots:     slots,
+		releaseFn: releaseFn,
+	}
+}
+
+func (l *handlerSlotLease) Release() {
+	l.once.Do(func() {
+		l.releaseFn(l.slots)
+	})
 }
 
 func newHandlerSlots(workers int) chan struct{} {

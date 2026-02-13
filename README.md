@@ -11,9 +11,11 @@
 - Worker pool (`Config.Workers`)
 - `Submit` / `SubmitBatch`（批次送入可降低 lock 開銷）
 - 可選單機持久化（`Config.Store` + `FileJobStore`）
+- Queue 上限保護（`Config.MaxPendingJobs`）
 - Job retry（指數退避 + jitter）
 - Non-retriable error（`dispatcher.MarkPermanent(err)`）
 - Duplicate 保護（pending + in-flight + recent TTL window）
+- Timeout detach budget（`Config.MaxDetachedHandlers`，預設關閉）
 - Graceful stop（`Stop(ctx)`）
 - Stop 後可重啟（`Start()`，前提是 handler 在 timeout 內返回或能響應 `ctx`）
 - Metrics snapshot
@@ -82,12 +84,15 @@ func example() error {
 store, _ := dispatcher.NewFileJobStore("./data/jobs.json")
 
 d, _ := dispatcher.New(dispatcher.Config{
-    Workers: 4,
-    Store:   store,
+    Workers:        4,
+    MaxPendingJobs: 10000,
+    Store:          store,
 })
 ```
 - 行為：`Submit/SubmitBatch` 寫入 store，`Start()` 會載入未完成 job，`finish` 後刪除。
 - 用途：單機重啟後可恢復未完成工作（不是分散式調度）。
+- `FileJobStore` 內部採「snapshot + append-only WAL」降低每次寫入全量重寫成本。
+- 同一路徑會做跨進程鎖保護（第二個進程會拿到 `ErrJobStoreLocked`）。
 
 ## 如何避免 N+1 / Cache / Async 問題
 
@@ -124,10 +129,13 @@ profile, err := cache.GetOrLoad(ctx, "u-1", loadProfile)
 - Dispatcher 批次併發處理
 - Retry/backoff 成功路徑
 - Duplicate + recent TTL 行為
+- Queue 上限拒絕策略
+- Timeout detach budget 行為
 - 停機後拒絕新工作
 - Stop 後重啟與 timeout 後最終重啟
 - Cache 單飛與 TTL 過期
 - Batch loader 併批與關閉行為
+- File store round-trip / lock / restart restore
 
 ## Benchmark（面試展示版）
 - Benchmark 檔案：`dispatcher/dispatcher_benchmark_test.go`
@@ -146,6 +154,8 @@ go test -run '^$' -bench BenchmarkDispatcherEndToEnd -benchmem ./dispatcher
 - 這是 in-process dispatcher，預設記憶體模式；若需要重啟恢復可接 `FileJobStore` 做單機持久化。
 - 不含分散式排程與跨節點協調，不是 XXL-JOB 類完整平台替代品。
 - 對不配合 context 的 handler/fetch，Go 無法強制 kill goroutine，只能以 timeout + 隔離策略控風險。
+- 可用 `MaxDetachedHandlers`（建議明確設定）在 timeout 後釋放 slot 以維持吞吐，但會接受受限的暫時重疊執行。
+- 可用 `MaxPendingJobs` 限制待處理量，避免極端流量下記憶體無上限膨脹。
 - `TTLCache` 單飛會共享同一個 in-flight load；每個 caller 可依自己的 context 提前返回，但背景 load 可能繼續到完成。
 - 設計優先順序是簡潔、可測試、可讀與單服務可落地，而非重型分散式特性。
 

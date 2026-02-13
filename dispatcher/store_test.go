@@ -15,6 +15,11 @@ func TestFileJobStoreRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new file job store: %v", err)
 	}
+	defer func() {
+		if closeErr := store.Close(); closeErr != nil {
+			t.Fatalf("close file job store: %v", closeErr)
+		}
+	}()
 
 	first := PersistedJob{
 		Job: Job{
@@ -65,10 +70,19 @@ func TestFileJobStoreRoundTrip(t *testing.T) {
 		t.Fatalf("unexpected remaining job id: %s", items[0].Job.ID)
 	}
 
+	if err = store.Close(); err != nil {
+		t.Fatalf("close file job store before reopen: %v", err)
+	}
+
 	reopened, err := NewFileJobStore(storePath)
 	if err != nil {
 		t.Fatalf("reopen file job store: %v", err)
 	}
+	defer func() {
+		if closeErr := reopened.Close(); closeErr != nil {
+			t.Fatalf("close reopened file job store: %v", closeErr)
+		}
+	}()
 
 	items, err = reopened.Load()
 	if err != nil {
@@ -79,11 +93,35 @@ func TestFileJobStoreRoundTrip(t *testing.T) {
 	}
 }
 
+func TestFileJobStoreRejectsSecondProcessLock(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "jobs.json")
+
+	first, err := NewFileJobStore(storePath)
+	if err != nil {
+		t.Fatalf("new first file job store: %v", err)
+	}
+	defer func() {
+		if closeErr := first.Close(); closeErr != nil {
+			t.Fatalf("close first file job store: %v", closeErr)
+		}
+	}()
+
+	_, err = NewFileJobStore(storePath)
+	if !errors.Is(err, ErrJobStoreLocked) {
+		t.Fatalf("expected ErrJobStoreLocked, got %v", err)
+	}
+}
+
 func TestDispatcherRestoresPersistedJobsOnStart(t *testing.T) {
 	store, err := NewFileJobStore(filepath.Join(t.TempDir(), "jobs.json"))
 	if err != nil {
 		t.Fatalf("new file job store: %v", err)
 	}
+	defer func() {
+		if closeErr := store.Close(); closeErr != nil {
+			t.Fatalf("close file job store: %v", closeErr)
+		}
+	}()
 
 	if err = store.Save(PersistedJob{
 		Job: Job{

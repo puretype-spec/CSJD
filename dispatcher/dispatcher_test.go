@@ -205,6 +205,61 @@ func TestDispatcherRejectsWhenStopped(t *testing.T) {
 	}
 }
 
+func TestDispatcherQueueFull(t *testing.T) {
+	d, err := New(Config{
+		Workers:            1,
+		RetryJitter:        0,
+		MaxPendingJobs:     1,
+		RecentDuplicateTTL: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("new dispatcher: %v", err)
+	}
+
+	block := make(chan struct{})
+	err = d.RegisterHandler("block", func(_ context.Context, _ Job) error {
+		<-block
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("register handler: %v", err)
+	}
+
+	if err = d.Start(); err != nil {
+		t.Fatalf("start dispatcher: %v", err)
+	}
+
+	if err = d.Submit(Job{ID: "full-1", Type: "block"}); err != nil {
+		t.Fatalf("submit first: %v", err)
+	}
+	if err = d.Submit(Job{ID: "full-2", Type: "block"}); !errors.Is(err, ErrQueueFull) {
+		t.Fatalf("expected ErrQueueFull, got %v", err)
+	}
+
+	report := d.SubmitBatch([]Job{
+		{ID: "full-b1", Type: "block"},
+		{ID: "full-b2", Type: "block"},
+	})
+	if report.Accepted != 0 {
+		t.Fatalf("expected 0 accepted in full queue, got %d", report.Accepted)
+	}
+	if len(report.Errors) != 2 {
+		t.Fatalf("expected 2 batch errors, got %d", len(report.Errors))
+	}
+	if !errors.Is(report.Errors[0], ErrQueueFull) || !errors.Is(report.Errors[1], ErrQueueFull) {
+		t.Fatalf("expected ErrQueueFull for both batch jobs, got %+v", report.Errors)
+	}
+
+	close(block)
+	waitForCondition(t, 2*time.Second, func() bool {
+		return d.Metrics().Succeeded == 1
+	})
+
+	if err = d.Stop(context.Background()); err != nil {
+		t.Fatalf("stop dispatcher: %v", err)
+	}
+}
+
 func TestDispatcherStopWithNilContext(t *testing.T) {
 	d, err := New(Config{Workers: 1, RetryJitter: 0})
 	if err != nil {
@@ -429,12 +484,13 @@ func TestDispatcherCanRestartAfterStopTimeoutEventually(t *testing.T) {
 
 func TestDispatcherTimeoutDoesNotRetry(t *testing.T) {
 	d, err := New(Config{
-		Workers:            1,
-		RetryJitter:        0,
-		RetryMinDelay:      10 * time.Millisecond,
-		RetryMaxDelay:      20 * time.Millisecond,
-		DefaultJobTimeout:  40 * time.Millisecond,
-		RecentDuplicateTTL: 10 * time.Millisecond,
+		Workers:             1,
+		RetryJitter:         0,
+		RetryMinDelay:       10 * time.Millisecond,
+		RetryMaxDelay:       20 * time.Millisecond,
+		MaxDetachedHandlers: 0,
+		DefaultJobTimeout:   40 * time.Millisecond,
+		RecentDuplicateTTL:  10 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatalf("new dispatcher: %v", err)
@@ -533,6 +589,68 @@ func TestDispatcherTimeoutDoesNotCreateOverlappingHandlerExecutions(t *testing.T
 	}
 	if maxActive.Load() > 1 {
 		t.Fatalf("expected non-overlapping non-cooperative handlers, max active=%d", maxActive.Load())
+	}
+
+	if err = d.Stop(context.Background()); err != nil {
+		t.Fatalf("stop dispatcher: %v", err)
+	}
+}
+
+func TestDispatcherTimeoutDetachBudgetAllowsProgress(t *testing.T) {
+	d, err := New(Config{
+		Workers:             1,
+		RetryJitter:         0,
+		MaxDetachedHandlers: 1,
+		DefaultJobTimeout:   40 * time.Millisecond,
+		RecentDuplicateTTL:  10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("new dispatcher: %v", err)
+	}
+
+	var active atomic.Int32
+	var maxActive atomic.Int32
+	err = d.RegisterHandler("slow-detach", func(_ context.Context, _ Job) error {
+		current := active.Add(1)
+		for {
+			observed := maxActive.Load()
+			if current <= observed {
+				break
+			}
+			if maxActive.CompareAndSwap(observed, current) {
+				break
+			}
+		}
+
+		time.Sleep(200 * time.Millisecond)
+		active.Add(-1)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("register handler: %v", err)
+	}
+
+	if err = d.Start(); err != nil {
+		t.Fatalf("start dispatcher: %v", err)
+	}
+
+	if err = d.Submit(Job{ID: "detach-1", Type: "slow-detach", MaxAttempts: 1}); err != nil {
+		t.Fatalf("submit detach-1: %v", err)
+	}
+	if err = d.Submit(Job{ID: "detach-2", Type: "slow-detach", MaxAttempts: 1}); err != nil {
+		t.Fatalf("submit detach-2: %v", err)
+	}
+
+	waitForCondition(t, 2*time.Second, func() bool {
+		return d.Metrics().Failed == 2
+	})
+
+	metrics := d.Metrics()
+	if metrics.Detached < 1 {
+		t.Fatalf("expected at least one detached timeout handler, got %d", metrics.Detached)
+	}
+	if maxActive.Load() < 2 {
+		t.Fatalf("expected detached budget to allow overlap, max active=%d", maxActive.Load())
 	}
 
 	if err = d.Stop(context.Background()); err != nil {

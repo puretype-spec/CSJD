@@ -17,15 +17,17 @@ const (
 
 // Config controls dispatcher behavior.
 type Config struct {
-	Workers            int
-	ReadyQueueSize     int
-	RetryMinDelay      time.Duration
-	RetryMaxDelay      time.Duration
-	RetryJitter        float64
-	DefaultMaxAttempts int
-	DefaultJobTimeout  time.Duration
-	RecentDuplicateTTL time.Duration
-	Store              JobStore
+	Workers             int
+	ReadyQueueSize      int
+	MaxPendingJobs      int
+	RetryMinDelay       time.Duration
+	RetryMaxDelay       time.Duration
+	RetryJitter         float64
+	MaxDetachedHandlers int
+	DefaultMaxAttempts  int
+	DefaultJobTimeout   time.Duration
+	RecentDuplicateTTL  time.Duration
+	Store               JobStore
 }
 
 func (c Config) normalize() (Config, error) {
@@ -59,6 +61,9 @@ func (c Config) normalize() (Config, error) {
 	if cfg.ReadyQueueSize < 1 {
 		return Config{}, errors.New("ready queue size must be >= 1")
 	}
+	if cfg.MaxPendingJobs < 0 {
+		return Config{}, errors.New("max pending jobs must be >= 0")
+	}
 	if cfg.RetryMinDelay < time.Millisecond {
 		return Config{}, errors.New("retry min delay must be >= 1ms")
 	}
@@ -76,6 +81,9 @@ func (c Config) normalize() (Config, error) {
 	}
 	if cfg.RecentDuplicateTTL < 0 {
 		return Config{}, errors.New("recent duplicate ttl must be >= 0")
+	}
+	if cfg.MaxDetachedHandlers < 0 {
+		return Config{}, errors.New("max detached handlers must be >= 0")
 	}
 
 	return cfg, nil

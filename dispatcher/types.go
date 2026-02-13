@@ -10,6 +10,8 @@ import (
 var (
 	// ErrDuplicateJob is returned when a job with the same ID already exists in pending/in-flight/recent window.
 	ErrDuplicateJob = errors.New("duplicate job id")
+	// ErrQueueFull is returned when queue capacity is reached.
+	ErrQueueFull = errors.New("dispatcher queue is full")
 	// ErrDispatcherClosed is returned when submitting to a stopped dispatcher.
 	ErrDispatcherClosed = errors.New("dispatcher is closed")
 	// ErrDispatcherNotStarted is returned when dispatcher has not started.
@@ -109,11 +111,12 @@ type MetricsSnapshot struct {
 	Succeeded  uint64
 	Failed     uint64
 	Panics     uint64
+	Detached   uint64
 }
 
 func (m MetricsSnapshot) String() string {
 	return fmt.Sprintf(
-		"submitted=%d accepted=%d duplicates=%d processed=%d retried=%d succeeded=%d failed=%d panics=%d",
+		"submitted=%d accepted=%d duplicates=%d processed=%d retried=%d succeeded=%d failed=%d panics=%d detached=%d",
 		m.Submitted,
 		m.Accepted,
 		m.Duplicates,
@@ -122,5 +125,6 @@ func (m MetricsSnapshot) String() string {
 		m.Succeeded,
 		m.Failed,
 		m.Panics,
+		m.Detached,
 	)
 }

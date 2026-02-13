@@ -80,5 +80,6 @@ func main() {
 		"succeeded", metrics.Succeeded,
 		"failed", metrics.Failed,
 		"panics", metrics.Panics,
+		"detached", metrics.Detached,
 	)
 }
