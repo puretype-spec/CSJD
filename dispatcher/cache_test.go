@@ -218,8 +218,8 @@ func TestTTLCacheGetOrLoadNotTiedToLeaderContextCancellation(t *testing.T) {
 
 	select {
 	case err := <-leaderDone:
-		if err != nil {
-			t.Fatalf("leader should complete with shared result, got %v", err)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("leader should respect its own timeout, got %v", err)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("leader did not finish")

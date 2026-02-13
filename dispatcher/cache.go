@@ -119,6 +119,10 @@ func (c *TTLCache[K, V]) GetOrLoad(ctx context.Context, key K, loader func(conte
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if err := ctx.Err(); err != nil {
+		var zero V
+		return zero, err
+	}
 
 	if value, ok := c.Get(key); ok {
 		return value, nil
@@ -135,49 +139,16 @@ func (c *TTLCache[K, V]) GetOrLoad(ctx context.Context, key K, loader func(conte
 	inFlight, exists := c.inFlight[key]
 	if exists {
 		c.mu.Unlock()
-		select {
-		case <-inFlight.done:
-			return inFlight.value, inFlight.err
-		case <-ctx.Done():
-			var zero V
-			return zero, ctx.Err()
-		}
+		return waitForCall(ctx, inFlight)
 	}
 
 	call := &cacheCall[V]{done: make(chan struct{})}
 	c.inFlight[key] = call
 	c.mu.Unlock()
 
-	var (
-		value V
-		err   error
-	)
+	c.runLoad(call, context.WithoutCancel(ctx), key, loader)
 
-	func() {
-		defer func() {
-			recovered := recover()
-			if recovered == nil {
-				return
-			}
-
-			err = fmt.Errorf("cache loader panic: %v", recovered)
-		}()
-
-		// Decouple in-flight loading from the first caller cancellation.
-		value, err = loader(context.WithoutCancel(ctx), key)
-	}()
-
-	c.mu.Lock()
-	if err == nil {
-		c.setLocked(key, value, time.Now())
-	}
-	delete(c.inFlight, key)
-	call.value = value
-	call.err = err
-	close(call.done)
-	c.mu.Unlock()
-
-	return value, err
+	return waitForCall(ctx, call)
 }
 
 func (c *TTLCache[K, V]) setLocked(key K, value V, now time.Time) {
@@ -194,4 +165,46 @@ func (c *TTLCache[K, V]) isExpired(entry cacheEntry[V], now time.Time) bool {
 	}
 
 	return !entry.expiresAt.After(now)
+}
+
+func (c *TTLCache[K, V]) runLoad(call *cacheCall[V], loadCtx context.Context, key K, loader func(context.Context, K) (V, error)) {
+	go func() {
+		var (
+			value V
+			err   error
+		)
+
+		func() {
+			defer func() {
+				recovered := recover()
+				if recovered == nil {
+					return
+				}
+
+				err = fmt.Errorf("cache loader panic: %v", recovered)
+			}()
+
+			value, err = loader(loadCtx, key)
+		}()
+
+		c.mu.Lock()
+		if err == nil {
+			c.setLocked(key, value, time.Now())
+		}
+		delete(c.inFlight, key)
+		call.value = value
+		call.err = err
+		close(call.done)
+		c.mu.Unlock()
+	}()
+}
+
+func waitForCall[V any](ctx context.Context, call *cacheCall[V]) (V, error) {
+	select {
+	case <-call.done:
+		return call.value, call.err
+	case <-ctx.Done():
+		var zero V
+		return zero, ctx.Err()
+	}
 }
