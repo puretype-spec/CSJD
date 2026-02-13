@@ -14,9 +14,10 @@
 - Non-retriable error（`dispatcher.MarkPermanent(err)`）
 - Duplicate 保護（pending + in-flight + recent TTL window）
 - Graceful stop（`Stop(ctx)`）
+- Stop 後可重啟（`Start()`）
 - Metrics snapshot
 - `TTLCache`（stampede 防護，`GetOrLoad` 單飛）
-- `BatchLoader`合併並行請求
+- `BatchLoader` 合併並行請求
 
 ## 專案結構
 - `dispatcher/dispatcher.go`：dispatcher 核心流程
@@ -92,6 +93,7 @@ profile, err := cache.GetOrLoad(ctx, "u-1", loadProfile)
 - Dispatcher 內部共享狀態受鎖保護，排程流程單點管理（scheduler loop）。
 - `Stop(ctx)` 有明確超時控制；worker 使用 context timeout。
 - handler panic 會被 recover，不會讓 worker goroutine 整批崩潰。
+- duplicate TTL cleanup 採節流策略，降低高頻事件下的掃描負擔。
 
 ## SonarLint 對齊重點
 - 函式短小、責任單一
@@ -105,5 +107,6 @@ profile, err := cache.GetOrLoad(ctx, "u-1", loadProfile)
 - Retry/backoff 成功路徑
 - Duplicate + recent TTL 行為
 - 停機後拒絕新工作
+- Stop 後重啟與 timeout 後最終重啟
 - Cache 單飛與 TTL 過期
 - Batch loader 併批與關閉行為

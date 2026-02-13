@@ -12,6 +12,8 @@ import (
 	"time"
 )
 
+const recentCleanupInterval = 500 * time.Millisecond
+
 type metricsCounters struct {
 	submitted  atomic.Uint64
 	accepted   atomic.Uint64
@@ -46,6 +48,8 @@ type Dispatcher struct {
 	started bool
 	closed  bool
 
+	lastRecentCleanup time.Time
+
 	wg sync.WaitGroup
 
 	backoffRand   *rand.Rand
@@ -68,8 +72,6 @@ func New(config Config) (*Dispatcher, error) {
 		pendingID:   make(map[string]struct{}),
 		inFlight:    make(map[string]struct{}),
 		recent:      newTTLSet(cfg.RecentDuplicateTTL),
-		notifyCh:    make(chan struct{}, 1),
-		readyCh:     make(chan scheduledJob, cfg.ReadyQueueSize),
 		backoffRand: rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 	heap.Init(&d.pending)
@@ -97,6 +99,11 @@ func (d *Dispatcher) RegisterHandler(jobType string, handler HandlerFunc) error 
 func (d *Dispatcher) Start() error {
 	d.stateMu.Lock()
 	if d.started {
+		if d.closed {
+			d.stateMu.Unlock()
+			return ErrDispatcherClosed
+		}
+
 		d.stateMu.Unlock()
 		return nil
 	}
@@ -106,6 +113,9 @@ func (d *Dispatcher) Start() error {
 	}
 
 	d.runCtx, d.cancel = context.WithCancel(context.Background())
+	d.notifyCh = make(chan struct{}, 1)
+	d.readyCh = make(chan scheduledJob, d.cfg.ReadyQueueSize)
+	d.lastRecentCleanup = time.Time{}
 	d.started = true
 	workers := d.cfg.Workers
 	d.stateMu.Unlock()
@@ -145,9 +155,14 @@ func (d *Dispatcher) Stop(ctx context.Context) error {
 	select {
 	case <-done:
 		d.cancelRunContext()
+		d.markStopped()
 		return nil
 	case <-ctx.Done():
 		d.cancelRunContext()
+		go func() {
+			<-done
+			d.markStopped()
+		}()
 		return ctx.Err()
 	}
 }
@@ -326,7 +341,7 @@ func (d *Dispatcher) nextDueJob() (*scheduledJob, time.Duration, bool) {
 	defer d.stateMu.Unlock()
 
 	now := time.Now()
-	d.recent.cleanupExpired(now)
+	d.cleanupRecentIfDueLocked(now)
 
 	if d.closed && len(d.pending) == 0 && len(d.inFlight) == 0 {
 		return nil, 0, true
@@ -515,6 +530,25 @@ func (d *Dispatcher) cancelRunContext() {
 	if cancel != nil {
 		cancel()
 	}
+}
+
+func (d *Dispatcher) cleanupRecentIfDueLocked(now time.Time) {
+	if d.lastRecentCleanup.IsZero() || now.Sub(d.lastRecentCleanup) >= recentCleanupInterval {
+		d.recent.cleanupExpired(now)
+		d.lastRecentCleanup = now
+	}
+}
+
+func (d *Dispatcher) markStopped() {
+	d.stateMu.Lock()
+	d.started = false
+	d.closed = false
+	d.runCtx = nil
+	d.cancel = nil
+	d.notifyCh = nil
+	d.readyCh = nil
+	d.lastRecentCleanup = time.Time{}
+	d.stateMu.Unlock()
 }
 
 func cloneBytes(value []byte) []byte {

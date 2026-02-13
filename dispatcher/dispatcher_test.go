@@ -197,8 +197,8 @@ func TestDispatcherRejectsWhenStopped(t *testing.T) {
 	}
 
 	err = d.Submit(Job{ID: "after-stop", Type: "noop"})
-	if !errors.Is(err, ErrDispatcherClosed) {
-		t.Fatalf("expected ErrDispatcherClosed, got: %v", err)
+	if !errors.Is(err, ErrDispatcherNotStarted) {
+		t.Fatalf("expected ErrDispatcherNotStarted, got: %v", err)
 	}
 }
 
@@ -331,6 +331,99 @@ func TestDispatcherCopiesPayloadOnSubmitBatch(t *testing.T) {
 	defer cancel()
 	if err = d.Stop(stopCtx); err != nil {
 		t.Fatalf("stop dispatcher: %v", err)
+	}
+}
+
+func TestDispatcherCanRestartAfterStop(t *testing.T) {
+	d, err := New(Config{Workers: 1, RetryJitter: 0})
+	if err != nil {
+		t.Fatalf("new dispatcher: %v", err)
+	}
+
+	var processed atomic.Int32
+	err = d.RegisterHandler("restart", func(_ context.Context, _ Job) error {
+		processed.Add(1)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("register handler: %v", err)
+	}
+
+	if err = d.Start(); err != nil {
+		t.Fatalf("start first run: %v", err)
+	}
+	if err = d.Submit(Job{ID: "restart-1", Type: "restart"}); err != nil {
+		t.Fatalf("submit first run: %v", err)
+	}
+	waitForCondition(t, 2*time.Second, func() bool { return processed.Load() == 1 })
+	if err = d.Stop(context.Background()); err != nil {
+		t.Fatalf("stop first run: %v", err)
+	}
+
+	if err = d.Start(); err != nil {
+		t.Fatalf("start second run: %v", err)
+	}
+	if err = d.Submit(Job{ID: "restart-2", Type: "restart"}); err != nil {
+		t.Fatalf("submit second run: %v", err)
+	}
+	waitForCondition(t, 2*time.Second, func() bool { return processed.Load() == 2 })
+	if err = d.Stop(context.Background()); err != nil {
+		t.Fatalf("stop second run: %v", err)
+	}
+}
+
+func TestDispatcherCanRestartAfterStopTimeoutEventually(t *testing.T) {
+	d, err := New(Config{Workers: 1, RetryJitter: 0, DefaultJobTimeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("new dispatcher: %v", err)
+	}
+
+	err = d.RegisterHandler("slow", func(ctx context.Context, _ Job) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
+			return nil
+		}
+	})
+	if err != nil {
+		t.Fatalf("register handler: %v", err)
+	}
+
+	if err = d.Start(); err != nil {
+		t.Fatalf("start first run: %v", err)
+	}
+	if err = d.Submit(Job{ID: "slow-1", Type: "slow"}); err != nil {
+		t.Fatalf("submit slow job: %v", err)
+	}
+
+	stopCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err = d.Stop(stopCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected stop timeout, got %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		err = d.Start()
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, ErrDispatcherClosed) {
+			t.Fatalf("unexpected start error while waiting restart readiness: %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("dispatcher did not become restartable after timeout stop")
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if err = d.Submit(Job{ID: "slow-2", Type: "slow"}); err != nil {
+		t.Fatalf("submit on restarted dispatcher: %v", err)
+	}
+	if err = d.Stop(context.Background()); err != nil {
+		t.Fatalf("stop restarted dispatcher: %v", err)
 	}
 }
 
