@@ -1,154 +1,139 @@
-# CSJD — Production-Safe Async Jobs in Go
+# CSJD - Production-Safe Async Jobs in Go
 
-> Most Go worker pools work perfectly…
-> until real traffic hits.
+CSJD is a reliability-first job dispatcher for Go.
 
-This repository exists because background jobs are deceptively simple in development, but fail in production.
+It supports two modes:
+- in-process dispatcher (single service, low operational overhead)
+- distributed dispatcher on Redis Streams (multi-node consumer group)
 
-Typical failures we encountered:
+## Why This Exists
 
-* Goroutine leaks after retries
-* Duplicate jobs after service restart
-* Retry storms killing the database
-* Cache stampede during traffic spikes
-* Lost tasks during shutdown
-* Panics silently skipping jobs
-* "Exactly once" turning into "at least 10 times"
+Background jobs are easy to start and hard to run safely under real traffic.
 
-Most job queue examples don't handle these.
+Common failure modes:
+- unbounded goroutines during retries
+- duplicate execution during restart/failover
+- retry storms on downstream dependencies
+- lost jobs during shutdown
+- silent handler panics
 
-CSJD demonstrates a **production-oriented async job execution model** — not just concurrency.
+CSJD focuses on bounded execution, controlled retries, explicit failure semantics, and recoverability.
 
----
+## Current Capabilities
 
-## What problem does this solve?
+- Worker pool (`Config.Workers` / `DistributedConfig.Workers`)
+- `Submit` / `SubmitBatch`
+- Exponential retry with jitter
+- Permanent error shortcut (`MarkPermanent`)
+- Queue cap (`MaxPendingJobs`)
+- Timeout detach budget (`MaxDetachedHandlers`, opt-in)
+- Panic capture
+- Metrics snapshot (`submitted`, `accepted`, `processed`, `retried`, `succeeded`, `failed`, `panics`, `detached`)
+- `TTLCache` with stampede protection (`GetOrLoad`)
+- `BatchLoader` for N+1 batching
+- File durable store (`FileJobStore`) with snapshot + WAL + process lock
+- Redis Streams distributed dispatcher with consumer group + autoclaim
 
-A typical Go worker pool:
+## Quick Start
+
+```bash
+go test ./...
+go run ./cmd/demo
+```
+
+## In-Process Usage
 
 ```go
-for job := range jobs {
-    go handle(job)
+package main
+
+import (
+    "context"
+    "time"
+
+    "csjd/dispatcher"
+)
+
+func main() {
+    store, _ := dispatcher.NewFileJobStore("./data/jobs.json")
+    defer store.Close()
+
+    d, _ := dispatcher.New(dispatcher.Config{
+        Workers:            4,
+        MaxPendingJobs:     10000,
+        MaxDetachedHandlers: 0, // keep strict non-overlap default
+        Store:              store,
+    })
+
+    _ = d.RegisterHandler("email", func(ctx context.Context, job dispatcher.Job) error {
+        return nil
+    })
+
+    _ = d.Start()
+    _ = d.Submit(dispatcher.Job{ID: "job-1", Type: "email"})
+
+    stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+    _ = d.Stop(stopCtx)
 }
 ```
 
-Looks fine — until:
-
-* context cancellation doesn't propagate
-* retry creates unbounded goroutines
-* multiple instances process same job
-* graceful shutdown drops tasks
-* DB / API meltdown due to retry bursts
-
-CSJD implements defensive patterns used in high-traffic backend systems.
-
----
-
-## Design Goals
-
-Instead of maximizing throughput, we optimize for **system survival**.
-
-| Concern         | Typical Worker Pool     | CSJD                     |
-| --------------- | ----------------------- | ------------------------ |
-| Retry control   | ❌ none                  | exponential backoff      |
-| Idempotency     | ❌ caller responsibility | built-in protection      |
-| Duplicate jobs  | ❌ possible              | prevented                |
-| Cache stampede  | ❌                       | singleflight + TTL cache |
-| Shutdown safety | ❌ drop tasks            | drain + handoff          |
-| Panic safety    | ❌ lost jobs             | captured + retry         |
-| Backpressure    | ❌ unlimited goroutines  | bounded concurrency      |
-
----
-
-## Core Concepts
-
-### 1) Bounded Concurrency
-
-Prevent goroutine explosions during spikes.
-
-### 2) Idempotent Execution
-
-A job may run multiple times — your system must behave as once.
-
-### 3) Retry With Control
-
-Retries must not become a denial-of-service attack on your own database.
-
-### 4) Graceful Shutdown Safety
-
-Server restarts must not corrupt system state.
-
----
-
-## Example
+## Distributed Usage (Redis Streams)
 
 ```go
-dispatcher := csjd.NewDispatcher(10)
+dist, _ := dispatcher.NewRedisDistributedDispatcher(
+    dispatcher.RedisConfig{
+        Addr: "127.0.0.1:6379",
+    },
+    dispatcher.DistributedConfig{
+        Workers:            8,
+        Stream:             "csjd:jobs",
+        Group:              "csjd-workers",
+        Consumer:           "node-a",
+        MaxPendingJobs:     20000,
+        DefaultMaxAttempts: 3,
+    },
+)
 
-dispatcher.Submit("send_email", userID, func(ctx context.Context) error {
-    return emailService.Send(ctx, userID)
+defer dist.Close(context.Background())
+
+_ = dist.RegisterHandler("email", func(ctx context.Context, job dispatcher.Job) error {
+    return nil
 })
+
+_ = dist.Start()
+_ = dist.Submit(dispatcher.Job{ID: "dist-1", Type: "email"})
 ```
 
-The dispatcher guarantees:
+## Delivery Semantics
 
-* bounded execution
-* retry safety
-* panic recovery
-* duplicate suppression
-* controlled shutdown
+- In-process mode: local process guarantees only.
+- Distributed mode: `at-least-once` delivery.
+- Consumer recovery uses `XAUTOCLAIM` for idle pending messages.
+- Handlers must be idempotent (or protected by external dedupe keys).
 
----
+## Reliability Guardrails
 
-## Why this project exists
+- `MaxPendingJobs`: reject overload with `ErrQueueFull`.
+- `MaxDetachedHandlers`: optional throughput protection when non-cooperative handlers ignore timeout.
+- File store locking: second process opening same store path gets `ErrJobStoreLocked`.
 
-After running high-traffic backend services, we discovered:
+## Testing
 
-Most outages were not caused by business logic —
-they were caused by background jobs behaving badly under load.
+```bash
+go test -count=1 ./...
+go test -race -count=1 ./...
+go vet ./...
+```
 
-This repo documents the patterns we now consider mandatory.
+Benchmark:
 
----
+```bash
+go test -run '^$' -bench BenchmarkDispatcherEndToEnd -benchmem ./dispatcher
+```
 
-## Roadmap
+## Tradeoffs and Limits
 
-Planned improvements:
+- No exactly-once guarantee in distributed mode.
+- Non-cooperative handlers/fetchers cannot be force-killed in Go.
+- Redis Streams mode currently targets one stream/group per dispatcher instance.
 
-* Distributed coordinator (multi-instance safety)
-* Redis storage backend
-* Dead letter queue
-* Metrics exporter (Prometheus)
-* Cron scheduler
-* Circuit breaker integration
-
----
-
-## Who is this for?
-
-Backend engineers building systems where failure matters:
-
-* payment systems
-* notification services
-* event processing
-* external API integrations
-* high traffic platforms
-
-If your system must survive restarts, spikes, and partial outages — this is relevant.
-
----
-
-## Non-Goals
-
-This is **not** a high-throughput message queue replacement.
-This is a **reliability-focused execution model**.
-
----
-
-## Inspiration
-
-Real production incidents.
-
----
-
-If this project saved you from debugging a 3AM outage,
-please consider ⭐ starring the repository.
