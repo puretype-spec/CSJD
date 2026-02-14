@@ -103,20 +103,22 @@ type BatchSubmitReport struct {
 
 // MetricsSnapshot is an immutable metrics view.
 type MetricsSnapshot struct {
-	Submitted  uint64
-	Accepted   uint64
-	Duplicates uint64
-	Processed  uint64
-	Retried    uint64
-	Succeeded  uint64
-	Failed     uint64
-	Panics     uint64
-	Detached   uint64
+	Submitted        uint64
+	Accepted         uint64
+	Duplicates       uint64
+	Processed        uint64
+	Retried          uint64
+	Succeeded        uint64
+	Failed           uint64
+	Panics           uint64
+	Detached         uint64
+	FinalizeErrors   uint64
+	DeadLetterErrors uint64
 }
 
 func (m MetricsSnapshot) String() string {
 	return fmt.Sprintf(
-		"submitted=%d accepted=%d duplicates=%d processed=%d retried=%d succeeded=%d failed=%d panics=%d detached=%d",
+		"submitted=%d accepted=%d duplicates=%d processed=%d retried=%d succeeded=%d failed=%d panics=%d detached=%d finalize_errors=%d dead_letter_errors=%d",
 		m.Submitted,
 		m.Accepted,
 		m.Duplicates,
@@ -126,5 +128,7 @@ func (m MetricsSnapshot) String() string {
 		m.Failed,
 		m.Panics,
 		m.Detached,
+		m.FinalizeErrors,
+		m.DeadLetterErrors,
 	)
 }

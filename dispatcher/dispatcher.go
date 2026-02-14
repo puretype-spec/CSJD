@@ -24,6 +24,8 @@ type metricsCounters struct {
 	failed     atomic.Uint64
 	panics     atomic.Uint64
 	detached   atomic.Uint64
+	finalize   atomic.Uint64
+	deadLetter atomic.Uint64
 }
 
 // Dispatcher is a concurrency-safe async job dispatcher.
@@ -332,15 +334,17 @@ func (d *Dispatcher) SubmitBatch(jobs []Job) BatchSubmitReport {
 // Metrics returns a point-in-time counter snapshot.
 func (d *Dispatcher) Metrics() MetricsSnapshot {
 	return MetricsSnapshot{
-		Submitted:  d.metrics.submitted.Load(),
-		Accepted:   d.metrics.accepted.Load(),
-		Duplicates: d.metrics.duplicates.Load(),
-		Processed:  d.metrics.processed.Load(),
-		Retried:    d.metrics.retried.Load(),
-		Succeeded:  d.metrics.succeeded.Load(),
-		Failed:     d.metrics.failed.Load(),
-		Panics:     d.metrics.panics.Load(),
-		Detached:   d.metrics.detached.Load(),
+		Submitted:        d.metrics.submitted.Load(),
+		Accepted:         d.metrics.accepted.Load(),
+		Duplicates:       d.metrics.duplicates.Load(),
+		Processed:        d.metrics.processed.Load(),
+		Retried:          d.metrics.retried.Load(),
+		Succeeded:        d.metrics.succeeded.Load(),
+		Failed:           d.metrics.failed.Load(),
+		Panics:           d.metrics.panics.Load(),
+		Detached:         d.metrics.detached.Load(),
+		FinalizeErrors:   d.metrics.finalize.Load(),
+		DeadLetterErrors: d.metrics.deadLetter.Load(),
 	}
 }
 

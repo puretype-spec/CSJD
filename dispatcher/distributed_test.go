@@ -125,6 +125,59 @@ func TestDistributedDispatcherRetriesUntilSuccess(t *testing.T) {
 	}
 }
 
+func TestDistributedDispatcherRetryBypassesQueueCap(t *testing.T) {
+	backend := newFakeDistributedBackend()
+	d, err := NewDistributedDispatcher(DistributedConfig{
+		Workers:            1,
+		Stream:             "jobs",
+		Group:              "group-a",
+		BatchSize:          4,
+		Block:              10 * time.Millisecond,
+		ClaimInterval:      100 * time.Millisecond,
+		ClaimMinIdle:       200 * time.Millisecond,
+		RetryJitter:        0,
+		RetryMinDelay:      5 * time.Millisecond,
+		RetryMaxDelay:      10 * time.Millisecond,
+		DefaultMaxAttempts: 3,
+		MaxPendingJobs:     1,
+	}, backend)
+	if err != nil {
+		t.Fatalf("new distributed dispatcher: %v", err)
+	}
+
+	var calls atomic.Int32
+	err = d.RegisterHandler("retry", func(_ context.Context, _ Job) error {
+		if calls.Add(1) == 1 {
+			return errors.New("transient")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("register handler: %v", err)
+	}
+
+	if err = d.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() {
+		if stopErr := d.Stop(context.Background()); stopErr != nil {
+			t.Fatalf("stop: %v", stopErr)
+		}
+	}()
+
+	if err = d.Submit(Job{ID: "retry-cap-1", Type: "retry"}); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+
+	waitForCondition(t, 2*time.Second, func() bool {
+		return d.Metrics().Succeeded == 1
+	})
+	metrics := d.Metrics()
+	if metrics.Retried != 1 {
+		t.Fatalf("expected retried=1 under queue cap, got %d", metrics.Retried)
+	}
+}
+
 func TestDistributedDispatcherQueueFull(t *testing.T) {
 	backend := newFakeDistributedBackend()
 	d, err := NewDistributedDispatcher(DistributedConfig{
@@ -472,6 +525,110 @@ func TestDistributedDispatcherPublishesDeadLetterOnDecodeFailure(t *testing.T) {
 	}
 }
 
+func TestDistributedDispatcherFinalizeRetriesOnAckDelFailures(t *testing.T) {
+	backend := newFakeDistributedBackend()
+	backend.ackFailCount = 1
+	backend.delFailCount = 1
+
+	d, err := NewDistributedDispatcher(DistributedConfig{
+		Workers:       1,
+		Stream:        "jobs",
+		Group:         "group-a",
+		BatchSize:     4,
+		Block:         10 * time.Millisecond,
+		ClaimInterval: 100 * time.Millisecond,
+		ClaimMinIdle:  200 * time.Millisecond,
+		RetryJitter:   0,
+	}, backend)
+	if err != nil {
+		t.Fatalf("new distributed dispatcher: %v", err)
+	}
+
+	err = d.RegisterHandler("ok", func(_ context.Context, _ Job) error {
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("register handler: %v", err)
+	}
+
+	if err = d.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() {
+		if stopErr := d.Stop(context.Background()); stopErr != nil {
+			t.Fatalf("stop: %v", stopErr)
+		}
+	}()
+
+	if err = d.Submit(Job{ID: "finalize-1", Type: "ok"}); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+
+	waitForCondition(t, 2*time.Second, func() bool {
+		return d.Metrics().Succeeded == 1
+	})
+	if got := backend.pendingLen(); got != 0 {
+		t.Fatalf("expected pending cleared after finalize retries, got %d", got)
+	}
+	if got := d.Metrics().FinalizeErrors; got != 0 {
+		t.Fatalf("expected finalize_errors=0, got %d", got)
+	}
+}
+
+func TestDistributedDispatcherDeadLetterFailureIsObservable(t *testing.T) {
+	backend := newFakeDistributedBackend()
+	backend.deadLetterFailCount = 1
+
+	d, err := NewDistributedDispatcher(DistributedConfig{
+		Workers:            1,
+		Stream:             "jobs",
+		Group:              "group-a",
+		BatchSize:          4,
+		Block:              10 * time.Millisecond,
+		ClaimInterval:      100 * time.Millisecond,
+		ClaimMinIdle:       200 * time.Millisecond,
+		RetryJitter:        0,
+		DefaultMaxAttempts: 1,
+	}, backend)
+	if err != nil {
+		t.Fatalf("new distributed dispatcher: %v", err)
+	}
+
+	err = d.RegisterHandler("fail", func(_ context.Context, _ Job) error {
+		return errors.New("boom")
+	})
+	if err != nil {
+		t.Fatalf("register handler: %v", err)
+	}
+
+	if err = d.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() {
+		if stopErr := d.Stop(context.Background()); stopErr != nil {
+			t.Fatalf("stop: %v", stopErr)
+		}
+	}()
+
+	if err = d.Submit(Job{ID: "dlq-fail-1", Type: "fail"}); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+
+	waitForCondition(t, 2*time.Second, func() bool {
+		return d.Metrics().Processed >= 1
+	})
+	metrics := d.Metrics()
+	if metrics.DeadLetterErrors < 1 {
+		t.Fatalf("expected dead letter errors >=1, got %d", metrics.DeadLetterErrors)
+	}
+	if metrics.Failed != 0 {
+		t.Fatalf("expected failed=0 when dlq publish fails, got %d", metrics.Failed)
+	}
+	if got := backend.pendingLen(); got == 0 {
+		t.Fatal("expected message to remain pending when dlq publish fails")
+	}
+}
+
 func TestDistributedDispatcherTimeoutDetachBudgetAllowsProgress(t *testing.T) {
 	backend := newFakeDistributedBackend()
 	d, err := NewDistributedDispatcher(DistributedConfig{
@@ -545,12 +702,15 @@ type fakeDistributedBackend struct {
 
 	ensureGroupErr error
 
-	queue          []distributedMessage
-	pending        map[string]distributedMessage
-	autoClaimQueue []distributedMessage
-	deadLetters    [][]byte
-	touchCount     map[string]int
-	nextID         uint64
+	queue               []distributedMessage
+	pending             map[string]distributedMessage
+	autoClaimQueue      []distributedMessage
+	deadLetters         [][]byte
+	touchCount          map[string]int
+	nextID              uint64
+	ackFailCount        int
+	delFailCount        int
+	deadLetterFailCount int
 
 	notify chan struct{}
 	closed bool
@@ -644,6 +804,11 @@ func (b *fakeDistributedBackend) AutoClaim(_ context.Context, _ time.Duration, s
 
 func (b *fakeDistributedBackend) Ack(_ context.Context, ids ...string) error {
 	b.mu.Lock()
+	if b.ackFailCount > 0 {
+		b.ackFailCount--
+		b.mu.Unlock()
+		return errors.New("injected ack failure")
+	}
 	for _, id := range ids {
 		delete(b.pending, id)
 	}
@@ -664,6 +829,11 @@ func (b *fakeDistributedBackend) Touch(_ context.Context, id string) error {
 
 func (b *fakeDistributedBackend) Del(_ context.Context, ids ...string) error {
 	b.mu.Lock()
+	if b.delFailCount > 0 {
+		b.delFailCount--
+		b.mu.Unlock()
+		return errors.New("injected delete failure")
+	}
 	for _, id := range ids {
 		delete(b.pending, id)
 	}
@@ -682,6 +852,10 @@ func (b *fakeDistributedBackend) Len(_ context.Context) (int64, error) {
 func (b *fakeDistributedBackend) AddDeadLetter(_ context.Context, body []byte) (string, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.deadLetterFailCount > 0 {
+		b.deadLetterFailCount--
+		return "", errors.New("injected dead letter failure")
+	}
 
 	b.deadLetters = append(b.deadLetters, append([]byte(nil), body...))
 	b.nextID++
@@ -752,4 +926,11 @@ func (b *fakeDistributedBackend) enqueueRawMessage(body []byte) string {
 	}
 
 	return id
+}
+
+func (b *fakeDistributedBackend) pendingLen() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return len(b.pending)
 }

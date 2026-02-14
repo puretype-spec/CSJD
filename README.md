@@ -28,7 +28,7 @@ CSJD focuses on bounded execution, controlled retries, explicit failure semantic
 - Atomic queue cap in distributed mode (`MaxPendingJobs`)
 - Timeout detach budget (`MaxDetachedHandlers`, opt-in)
 - Panic capture
-- Metrics snapshot (`submitted`, `accepted`, `processed`, `retried`, `succeeded`, `failed`, `panics`, `detached`)
+- Metrics snapshot (`submitted`, `accepted`, `processed`, `retried`, `succeeded`, `failed`, `panics`, `detached`, `finalize_errors`, `dead_letter_errors`)
 - `TTLCache` with stampede protection (`GetOrLoad`)
 - `BatchLoader` for N+1 batching
 - File durable store (`FileJobStore`) with snapshot + WAL + process lock
@@ -117,8 +117,10 @@ _ = dist.Submit(dispatcher.Job{ID: "dist-1", Type: "email"})
 ## Reliability Guardrails
 
 - `MaxPendingJobs`: reject overload with `ErrQueueFull` (atomic in Redis path).
+- Retry re-enqueue bypasses queue cap to avoid self-deadlock at full capacity.
 - `MaxDetachedHandlers`: optional throughput protection when non-cooperative handlers ignore timeout.
 - Terminal failures (decode/permanent/max-attempts) are published to DLQ before ACK/DEL; if DLQ write fails, the message stays pending for reclaim.
+- ACK/DEL and DLQ failures are exposed via metrics (`finalize_errors`, `dead_letter_errors`).
 - File store locking: second process opening same store path gets `ErrJobStoreLocked`.
 
 ## Testing

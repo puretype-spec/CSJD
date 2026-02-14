@@ -18,6 +18,8 @@ const (
 	defaultDistributedBlock         = time.Second
 	defaultDistributedClaimInterval = 2 * time.Second
 	defaultDistributedClaimMinIdle  = 10 * time.Second
+	distributedFinalizeMaxAttempts  = 3
+	distributedFinalizeBaseDelay    = 10 * time.Millisecond
 )
 
 type distributedMessage struct {
@@ -345,7 +347,7 @@ func (d *DistributedDispatcher) Submit(job Job) error {
 		Attempt: 1,
 	}
 
-	if err := d.enqueueEnvelope(context.Background(), envelope); err != nil {
+	if err := d.enqueueEnvelope(context.Background(), envelope, true); err != nil {
 		return err
 	}
 	d.metrics.accepted.Add(1)
@@ -391,7 +393,7 @@ func (d *DistributedDispatcher) SubmitBatch(jobs []Job) BatchSubmitReport {
 			Job:     cloneJob(job),
 			Attempt: 1,
 		}
-		if err := d.enqueueEnvelope(context.Background(), envelope); err != nil {
+		if err := d.enqueueEnvelope(context.Background(), envelope, true); err != nil {
 			setError(i, err)
 			continue
 		}
@@ -406,15 +408,17 @@ func (d *DistributedDispatcher) SubmitBatch(jobs []Job) BatchSubmitReport {
 // Metrics returns a point-in-time counter snapshot.
 func (d *DistributedDispatcher) Metrics() MetricsSnapshot {
 	return MetricsSnapshot{
-		Submitted:  d.metrics.submitted.Load(),
-		Accepted:   d.metrics.accepted.Load(),
-		Duplicates: d.metrics.duplicates.Load(),
-		Processed:  d.metrics.processed.Load(),
-		Retried:    d.metrics.retried.Load(),
-		Succeeded:  d.metrics.succeeded.Load(),
-		Failed:     d.metrics.failed.Load(),
-		Panics:     d.metrics.panics.Load(),
-		Detached:   d.metrics.detached.Load(),
+		Submitted:        d.metrics.submitted.Load(),
+		Accepted:         d.metrics.accepted.Load(),
+		Duplicates:       d.metrics.duplicates.Load(),
+		Processed:        d.metrics.processed.Load(),
+		Retried:          d.metrics.retried.Load(),
+		Succeeded:        d.metrics.succeeded.Load(),
+		Failed:           d.metrics.failed.Load(),
+		Panics:           d.metrics.panics.Load(),
+		Detached:         d.metrics.detached.Load(),
+		FinalizeErrors:   d.metrics.finalize.Load(),
+		DeadLetterErrors: d.metrics.deadLetter.Load(),
 	}
 }
 
@@ -528,8 +532,10 @@ func (d *DistributedDispatcher) processMessage(message distributedMessage) {
 
 	err = d.executeEnvelope(envelope)
 	if err == nil {
-		_ = d.backend.Ack(d.runCtx, message.ID)
-		_ = d.backend.Del(d.runCtx, message.ID)
+		if finalizeErr := d.finalizeMessageWithRetry(message.ID); finalizeErr != nil {
+			d.metrics.finalize.Add(1)
+			return
+		}
 		d.metrics.succeeded.Add(1)
 		return
 	}
@@ -561,12 +567,14 @@ func (d *DistributedDispatcher) processMessage(message distributedMessage) {
 	}
 
 	envelope.Attempt++
-	if enqueueErr := d.enqueueEnvelope(d.runCtx, envelope); enqueueErr != nil {
+	if enqueueErr := d.enqueueEnvelope(d.runCtx, envelope, false); enqueueErr != nil {
 		return
 	}
 
-	_ = d.backend.Ack(d.runCtx, message.ID)
-	_ = d.backend.Del(d.runCtx, message.ID)
+	if finalizeErr := d.finalizeMessageWithRetry(message.ID); finalizeErr != nil {
+		d.metrics.finalize.Add(1)
+		return
+	}
 	d.metrics.retried.Add(1)
 }
 
@@ -639,13 +647,17 @@ func (d *DistributedDispatcher) executeEnvelope(envelope distributedEnvelope) er
 	}
 }
 
-func (d *DistributedDispatcher) enqueueEnvelope(ctx context.Context, envelope distributedEnvelope) error {
+func (d *DistributedDispatcher) enqueueEnvelope(ctx context.Context, envelope distributedEnvelope, enforceQueueCap bool) error {
 	body, err := json.Marshal(envelope)
 	if err != nil {
 		return fmt.Errorf("marshal distributed envelope: %w", err)
 	}
 
-	if _, err = d.backend.Add(ctx, body, d.cfg.MaxPendingJobs); err != nil {
+	maxPending := 0
+	if enforceQueueCap {
+		maxPending = d.cfg.MaxPendingJobs
+	}
+	if _, err = d.backend.Add(ctx, body, maxPending); err != nil {
 		if errors.Is(err, ErrQueueFull) {
 			return ErrQueueFull
 		}
@@ -751,17 +763,58 @@ func (d *DistributedDispatcher) finalizeDeadLetter(message distributedMessage, e
 
 	body, err := json.Marshal(deadLetter)
 	if err != nil {
+		d.metrics.deadLetter.Add(1)
 		return fmt.Errorf("marshal dead letter %s: %w", message.ID, err)
 	}
 	if _, err = d.backend.AddDeadLetter(d.runCtx, body); err != nil {
+		d.metrics.deadLetter.Add(1)
 		return fmt.Errorf("publish dead letter %s: %w", message.ID, err)
 	}
 
-	_ = d.backend.Ack(d.runCtx, message.ID)
-	_ = d.backend.Del(d.runCtx, message.ID)
+	if err = d.finalizeMessageWithRetry(message.ID); err != nil {
+		d.metrics.finalize.Add(1)
+		d.metrics.deadLetter.Add(1)
+		return fmt.Errorf("finalize dead letter %s: %w", message.ID, err)
+	}
 	d.metrics.failed.Add(1)
 
 	return nil
+}
+
+func (d *DistributedDispatcher) finalizeMessageWithRetry(messageID string) error {
+	var lastErr error
+	delay := distributedFinalizeBaseDelay
+	for attempt := 1; attempt <= distributedFinalizeMaxAttempts; attempt++ {
+		if ackErr := d.backend.Ack(d.runCtx, messageID); ackErr != nil {
+			lastErr = fmt.Errorf("ack distributed message %s: %w", messageID, ackErr)
+		} else if delErr := d.backend.Del(d.runCtx, messageID); delErr != nil {
+			lastErr = fmt.Errorf("delete distributed message %s: %w", messageID, delErr)
+		} else {
+			return nil
+		}
+
+		if attempt == distributedFinalizeMaxAttempts {
+			break
+		}
+
+		timer := time.NewTimer(delay)
+		select {
+		case <-d.runCtx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return lastErr
+		case <-timer.C:
+		}
+		if delay < 200*time.Millisecond {
+			delay *= 2
+		}
+	}
+
+	return lastErr
 }
 
 func errorText(err error) string {
