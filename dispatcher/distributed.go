@@ -27,11 +27,13 @@ type distributedMessage struct {
 
 type distributedBackend interface {
 	EnsureGroup(ctx context.Context) error
-	Add(ctx context.Context, body []byte) (string, error)
+	Add(ctx context.Context, body []byte, maxPending int) (string, error)
 	ReadGroup(ctx context.Context, count int64, block time.Duration) ([]distributedMessage, error)
 	AutoClaim(ctx context.Context, minIdle time.Duration, start string, count int64) ([]distributedMessage, string, error)
+	Touch(ctx context.Context, id string) error
 	Ack(ctx context.Context, ids ...string) error
 	Del(ctx context.Context, ids ...string) error
+	AddDeadLetter(ctx context.Context, body []byte) (string, error)
 	Len(ctx context.Context) (int64, error)
 	Close() error
 }
@@ -40,6 +42,7 @@ type distributedBackend interface {
 type DistributedConfig struct {
 	Workers             int
 	Stream              string
+	DeadLetterStream    string
 	Group               string
 	Consumer            string
 	BatchSize           int64
@@ -62,6 +65,12 @@ func (c DistributedConfig) normalize() (DistributedConfig, error) {
 	}
 	if cfg.Stream == "" {
 		return DistributedConfig{}, errors.New("stream is required")
+	}
+	if cfg.DeadLetterStream == "" {
+		cfg.DeadLetterStream = cfg.Stream + ":dlq"
+	}
+	if cfg.DeadLetterStream == cfg.Stream {
+		return DistributedConfig{}, errors.New("dead letter stream must be different from stream")
 	}
 	if cfg.Group == "" {
 		return DistributedConfig{}, errors.New("group is required")
@@ -152,8 +161,9 @@ type DistributedDispatcher struct {
 	cfg     DistributedConfig
 	backend distributedBackend
 
-	stateMu   sync.Mutex
-	handlerMu sync.RWMutex
+	stateMu    sync.Mutex
+	handlerMu  sync.RWMutex
+	deliveryMu sync.Mutex
 
 	handlers map[string]HandlerFunc
 
@@ -164,6 +174,7 @@ type DistributedDispatcher struct {
 	closed  bool
 
 	deliveries chan distributedMessage
+	inFlight   map[string]struct{}
 
 	wg sync.WaitGroup
 
@@ -241,6 +252,7 @@ func (d *DistributedDispatcher) Start() error {
 	}
 	d.runCtx, d.cancel = context.WithCancel(context.Background())
 	d.deliveries = make(chan distributedMessage, max(1, d.cfg.Workers)*int(d.cfg.BatchSize)*2)
+	d.inFlight = make(map[string]struct{})
 	d.handlerSlots = newHandlerSlots(d.cfg.Workers)
 	d.detachedInFlight.Store(0)
 	d.started = true
@@ -324,16 +336,6 @@ func (d *DistributedDispatcher) Submit(job Job) error {
 		return err
 	}
 
-	if d.cfg.MaxPendingJobs > 0 {
-		length, err := d.backend.Len(context.Background())
-		if err != nil {
-			return err
-		}
-		if length >= int64(d.cfg.MaxPendingJobs) {
-			return ErrQueueFull
-		}
-	}
-
 	if job.CreatedAt.IsZero() {
 		job.CreatedAt = time.Now()
 	}
@@ -379,18 +381,6 @@ func (d *DistributedDispatcher) SubmitBatch(jobs []Job) BatchSubmitReport {
 			report.Invalid++
 			setError(i, err)
 			continue
-		}
-
-		if d.cfg.MaxPendingJobs > 0 {
-			length, err := d.backend.Len(context.Background())
-			if err != nil {
-				setError(i, err)
-				continue
-			}
-			if length >= int64(d.cfg.MaxPendingJobs) {
-				setError(i, ErrQueueFull)
-				continue
-			}
 		}
 
 		if job.CreatedAt.IsZero() {
@@ -467,9 +457,7 @@ func (d *DistributedDispatcher) readLoop() {
 		}
 
 		for _, message := range messages {
-			select {
-			case d.deliveries <- message:
-			case <-d.runCtx.Done():
+			if !d.enqueueDelivery(message) && d.runCtx.Err() != nil {
 				return
 			}
 		}
@@ -501,9 +489,7 @@ func (d *DistributedDispatcher) claimLoop() {
 			}
 
 			for _, message := range messages {
-				select {
-				case d.deliveries <- message:
-				case <-d.runCtx.Done():
+				if !d.enqueueDelivery(message) && d.runCtx.Err() != nil {
 					return
 				}
 			}
@@ -529,15 +515,16 @@ func (d *DistributedDispatcher) workerLoop() {
 }
 
 func (d *DistributedDispatcher) processMessage(message distributedMessage) {
+	defer d.releaseDelivery(message.ID)
 	d.metrics.processed.Add(1)
 
 	envelope, err := decodeEnvelope(message.Body)
 	if err != nil {
-		_ = d.backend.Ack(d.runCtx, message.ID)
-		_ = d.backend.Del(d.runCtx, message.ID)
-		d.metrics.failed.Add(1)
+		_ = d.finalizeDeadLetter(message, nil, "decode_error", err)
 		return
 	}
+	stopHeartbeat := d.startClaimHeartbeat(message.ID)
+	defer stopHeartbeat()
 
 	err = d.executeEnvelope(envelope)
 	if err == nil {
@@ -549,9 +536,11 @@ func (d *DistributedDispatcher) processMessage(message distributedMessage) {
 
 	maxAttempts := envelope.Job.effectiveMaxAttempts(d.cfg.DefaultMaxAttempts)
 	if isPermanentError(err) || envelope.Attempt >= maxAttempts {
-		_ = d.backend.Ack(d.runCtx, message.ID)
-		_ = d.backend.Del(d.runCtx, message.ID)
-		d.metrics.failed.Add(1)
+		reason := "max_attempts_exhausted"
+		if isPermanentError(err) {
+			reason = "permanent_error"
+		}
+		_ = d.finalizeDeadLetter(message, &envelope, reason, err)
 		return
 	}
 
@@ -656,11 +645,131 @@ func (d *DistributedDispatcher) enqueueEnvelope(ctx context.Context, envelope di
 		return fmt.Errorf("marshal distributed envelope: %w", err)
 	}
 
-	if _, err = d.backend.Add(ctx, body); err != nil {
+	if _, err = d.backend.Add(ctx, body, d.cfg.MaxPendingJobs); err != nil {
+		if errors.Is(err, ErrQueueFull) {
+			return ErrQueueFull
+		}
 		return fmt.Errorf("enqueue distributed job %s: %w", envelope.Job.ID, err)
 	}
 
 	return nil
+}
+
+type distributedDeadLetter struct {
+	MessageID string    `json:"message_id"`
+	FailedAt  time.Time `json:"failed_at"`
+	Reason    string    `json:"reason"`
+	Error     string    `json:"error"`
+	Attempt   int       `json:"attempt"`
+	Job       *Job      `json:"job,omitempty"`
+	RawBody   []byte    `json:"raw_body,omitempty"`
+}
+
+func (d *DistributedDispatcher) enqueueDelivery(message distributedMessage) bool {
+	if !d.reserveDelivery(message.ID) {
+		return false
+	}
+
+	select {
+	case d.deliveries <- message:
+		return true
+	case <-d.runCtx.Done():
+		d.releaseDelivery(message.ID)
+		return false
+	}
+}
+
+func (d *DistributedDispatcher) reserveDelivery(id string) bool {
+	d.deliveryMu.Lock()
+	defer d.deliveryMu.Unlock()
+	if d.inFlight == nil {
+		d.inFlight = make(map[string]struct{})
+	}
+	if _, exists := d.inFlight[id]; exists {
+		return false
+	}
+	d.inFlight[id] = struct{}{}
+
+	return true
+}
+
+func (d *DistributedDispatcher) releaseDelivery(id string) {
+	d.deliveryMu.Lock()
+	delete(d.inFlight, id)
+	d.deliveryMu.Unlock()
+}
+
+func (d *DistributedDispatcher) startClaimHeartbeat(messageID string) func() {
+	if messageID == "" {
+		return func() {}
+	}
+	d.stateMu.Lock()
+	runCtx := d.runCtx
+	d.stateMu.Unlock()
+	if runCtx == nil {
+		return func() {}
+	}
+
+	interval := d.cfg.ClaimMinIdle / 2
+	if interval < 100*time.Millisecond {
+		interval = 100 * time.Millisecond
+	}
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-runCtx.Done():
+				return
+			case <-ticker.C:
+				_ = d.backend.Touch(runCtx, messageID)
+			}
+		}
+	}()
+
+	return func() {
+		close(done)
+	}
+}
+
+func (d *DistributedDispatcher) finalizeDeadLetter(message distributedMessage, envelope *distributedEnvelope, reason string, cause error) error {
+	deadLetter := distributedDeadLetter{
+		MessageID: message.ID,
+		FailedAt:  time.Now().UTC(),
+		Reason:    reason,
+		Error:     errorText(cause),
+		RawBody:   append([]byte(nil), message.Body...),
+	}
+	if envelope != nil {
+		clonedJob := cloneJob(envelope.Job)
+		deadLetter.Job = &clonedJob
+		deadLetter.Attempt = envelope.Attempt
+	}
+
+	body, err := json.Marshal(deadLetter)
+	if err != nil {
+		return fmt.Errorf("marshal dead letter %s: %w", message.ID, err)
+	}
+	if _, err = d.backend.AddDeadLetter(d.runCtx, body); err != nil {
+		return fmt.Errorf("publish dead letter %s: %w", message.ID, err)
+	}
+
+	_ = d.backend.Ack(d.runCtx, message.ID)
+	_ = d.backend.Del(d.runCtx, message.ID)
+	d.metrics.failed.Add(1)
+
+	return nil
+}
+
+func errorText(err error) string {
+	if err == nil {
+		return ""
+	}
+
+	return err.Error()
 }
 
 func decodeEnvelope(body []byte) (distributedEnvelope, error) {
@@ -767,5 +876,6 @@ func (d *DistributedDispatcher) markStopped() {
 	d.runCtx = nil
 	d.cancel = nil
 	d.deliveries = nil
+	d.inFlight = nil
 	d.stateMu.Unlock()
 }

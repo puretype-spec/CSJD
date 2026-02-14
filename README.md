@@ -25,14 +25,15 @@ CSJD focuses on bounded execution, controlled retries, explicit failure semantic
 - `Submit` / `SubmitBatch`
 - Exponential retry with jitter
 - Permanent error shortcut (`MarkPermanent`)
-- Queue cap (`MaxPendingJobs`)
+- Atomic queue cap in distributed mode (`MaxPendingJobs`)
 - Timeout detach budget (`MaxDetachedHandlers`, opt-in)
 - Panic capture
 - Metrics snapshot (`submitted`, `accepted`, `processed`, `retried`, `succeeded`, `failed`, `panics`, `detached`)
 - `TTLCache` with stampede protection (`GetOrLoad`)
 - `BatchLoader` for N+1 batching
 - File durable store (`FileJobStore`) with snapshot + WAL + process lock
-- Redis Streams distributed dispatcher with consumer group + autoclaim
+- Redis Streams distributed dispatcher with consumer group + autoclaim + heartbeat touch
+- Dead-letter stream (`DeadLetterStream`, default: `<Stream>:dlq`)
 
 ## Quick Start
 
@@ -87,6 +88,7 @@ dist, _ := dispatcher.NewRedisDistributedDispatcher(
     dispatcher.DistributedConfig{
         Workers:            8,
         Stream:             "csjd:jobs",
+        DeadLetterStream:   "csjd:jobs:dlq", // optional, default is "<Stream>:dlq"
         Group:              "csjd-workers",
         Consumer:           "node-a",
         MaxPendingJobs:     20000,
@@ -109,12 +111,14 @@ _ = dist.Submit(dispatcher.Job{ID: "dist-1", Type: "email"})
 - In-process mode: local process guarantees only.
 - Distributed mode: `at-least-once` delivery.
 - Consumer recovery uses `XAUTOCLAIM` for idle pending messages.
+- In-flight processing periodically touches pending ownership to reduce accidental reclaim.
 - Handlers must be idempotent (or protected by external dedupe keys).
 
 ## Reliability Guardrails
 
-- `MaxPendingJobs`: reject overload with `ErrQueueFull`.
+- `MaxPendingJobs`: reject overload with `ErrQueueFull` (atomic in Redis path).
 - `MaxDetachedHandlers`: optional throughput protection when non-cooperative handlers ignore timeout.
+- Terminal failures (decode/permanent/max-attempts) are published to DLQ before ACK/DEL; if DLQ write fails, the message stays pending for reclaim.
 - File store locking: second process opening same store path gets `ErrJobStoreLocked`.
 
 ## Testing
@@ -136,4 +140,3 @@ go test -run '^$' -bench BenchmarkDispatcherEndToEnd -benchmem ./dispatcher
 - No exactly-once guarantee in distributed mode.
 - Non-cooperative handlers/fetchers cannot be force-killed in Go.
 - Redis Streams mode currently targets one stream/group per dispatcher instance.
-

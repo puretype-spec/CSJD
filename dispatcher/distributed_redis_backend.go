@@ -10,6 +10,19 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+const redisQueueFullToken = "CSJD_QUEUE_FULL"
+
+var addWithQueueCapScript = redis.NewScript(`
+local max_pending = tonumber(ARGV[1])
+if max_pending ~= nil and max_pending > 0 then
+  local current = redis.call("XLEN", KEYS[1])
+  if current >= max_pending then
+    return redis.error_reply("CSJD_QUEUE_FULL")
+  end
+end
+return redis.call("XADD", KEYS[1], "*", "body", ARGV[2])
+`)
+
 // RedisConfig controls how distributed dispatcher connects to Redis.
 type RedisConfig struct {
 	Addr     string
@@ -18,10 +31,11 @@ type RedisConfig struct {
 }
 
 type redisStreamBackend struct {
-	client   *redis.Client
-	stream   string
-	group    string
-	consumer string
+	client           *redis.Client
+	stream           string
+	deadLetterStream string
+	group            string
+	consumer         string
 }
 
 // NewRedisDistributedDispatcher creates a distributed dispatcher backed by Redis Streams.
@@ -47,10 +61,11 @@ func NewRedisDistributedDispatcher(redisCfg RedisConfig, cfg DistributedConfig) 
 	}
 
 	backend := &redisStreamBackend{
-		client:   client,
-		stream:   normalized.Stream,
-		group:    normalized.Group,
-		consumer: normalized.Consumer,
+		client:           client,
+		stream:           normalized.Stream,
+		deadLetterStream: normalized.DeadLetterStream,
+		group:            normalized.Group,
+		consumer:         normalized.Consumer,
 	}
 
 	dispatcher, err := NewDistributedDispatcher(normalized, backend)
@@ -74,11 +89,28 @@ func (b *redisStreamBackend) EnsureGroup(ctx context.Context) error {
 	return err
 }
 
-func (b *redisStreamBackend) Add(ctx context.Context, body []byte) (string, error) {
-	return b.client.XAdd(ctx, &redis.XAddArgs{
-		Stream: b.stream,
-		Values: map[string]any{"body": string(body)},
-	}).Result()
+func (b *redisStreamBackend) Add(ctx context.Context, body []byte, maxPending int) (string, error) {
+	if maxPending <= 0 {
+		return b.client.XAdd(ctx, &redis.XAddArgs{
+			Stream: b.stream,
+			Values: map[string]any{"body": string(body)},
+		}).Result()
+	}
+
+	result, err := addWithQueueCapScript.Run(ctx, b.client, []string{b.stream}, maxPending, string(body)).Result()
+	if err != nil {
+		if strings.Contains(err.Error(), redisQueueFullToken) {
+			return "", ErrQueueFull
+		}
+
+		return "", err
+	}
+	id, ok := result.(string)
+	if !ok {
+		return "", fmt.Errorf("unexpected redis add result type %T", result)
+	}
+
+	return id, nil
 }
 
 func (b *redisStreamBackend) ReadGroup(ctx context.Context, count int64, block time.Duration) ([]distributedMessage, error) {
@@ -138,11 +170,37 @@ func (b *redisStreamBackend) Ack(ctx context.Context, ids ...string) error {
 	return b.client.XAck(ctx, b.stream, b.group, ids...).Err()
 }
 
+func (b *redisStreamBackend) Touch(ctx context.Context, id string) error {
+	if id == "" {
+		return nil
+	}
+
+	_, err := b.client.XClaim(ctx, &redis.XClaimArgs{
+		Stream:   b.stream,
+		Group:    b.group,
+		Consumer: b.consumer,
+		MinIdle:  0,
+		Messages: []string{id},
+	}).Result()
+	if err != nil && errors.Is(err, redis.Nil) {
+		return nil
+	}
+
+	return err
+}
+
 func (b *redisStreamBackend) Del(ctx context.Context, ids ...string) error {
 	if len(ids) == 0 {
 		return nil
 	}
 	return b.client.XDel(ctx, b.stream, ids...).Err()
+}
+
+func (b *redisStreamBackend) AddDeadLetter(ctx context.Context, body []byte) (string, error) {
+	return b.client.XAdd(ctx, &redis.XAddArgs{
+		Stream: b.deadLetterStream,
+		Values: map[string]any{"body": string(body)},
+	}).Result()
 }
 
 func (b *redisStreamBackend) Len(ctx context.Context) (int64, error) {

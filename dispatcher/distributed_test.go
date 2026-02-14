@@ -2,6 +2,7 @@ package dispatcher
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -173,6 +174,304 @@ func TestDistributedDispatcherQueueFull(t *testing.T) {
 	}
 }
 
+func TestDistributedDispatcherQueueCapIsAtomicAcrossConcurrentSubmit(t *testing.T) {
+	backend := newFakeDistributedBackend()
+	d, err := NewDistributedDispatcher(DistributedConfig{
+		Workers:        1,
+		Stream:         "jobs",
+		Group:          "group-a",
+		BatchSize:      4,
+		Block:          10 * time.Millisecond,
+		ClaimInterval:  100 * time.Millisecond,
+		ClaimMinIdle:   200 * time.Millisecond,
+		RetryJitter:    0,
+		MaxPendingJobs: 1,
+	}, backend)
+	if err != nil {
+		t.Fatalf("new distributed dispatcher: %v", err)
+	}
+
+	block := make(chan struct{})
+	err = d.RegisterHandler("slow", func(_ context.Context, _ Job) error {
+		<-block
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("register handler: %v", err)
+	}
+
+	if err = d.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() {
+		close(block)
+		if stopErr := d.Stop(context.Background()); stopErr != nil {
+			t.Fatalf("stop: %v", stopErr)
+		}
+	}()
+
+	start := make(chan struct{})
+	resultCh := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		jobID := fmt.Sprintf("atomic-%d", i)
+		go func(id string) {
+			<-start
+			resultCh <- d.Submit(Job{ID: id, Type: "slow"})
+		}(jobID)
+	}
+	close(start)
+
+	results := []error{<-resultCh, <-resultCh}
+	var accepted int
+	var queueFull int
+	for _, submitErr := range results {
+		if submitErr == nil {
+			accepted++
+			continue
+		}
+		if errors.Is(submitErr, ErrQueueFull) {
+			queueFull++
+			continue
+		}
+		t.Fatalf("unexpected submit error: %v", submitErr)
+	}
+	if accepted != 1 || queueFull != 1 {
+		t.Fatalf("expected exactly 1 accepted and 1 queue full, got accepted=%d queueFull=%d", accepted, queueFull)
+	}
+}
+
+func TestDistributedDispatcherSkipsClaimedDuplicateWhileInFlight(t *testing.T) {
+	backend := newFakeDistributedBackend()
+	d, err := NewDistributedDispatcher(DistributedConfig{
+		Workers:       1,
+		Stream:        "jobs",
+		Group:         "group-a",
+		BatchSize:     4,
+		Block:         10 * time.Millisecond,
+		ClaimInterval: 10 * time.Millisecond,
+		ClaimMinIdle:  20 * time.Millisecond,
+		RetryJitter:   0,
+	}, backend)
+	if err != nil {
+		t.Fatalf("new distributed dispatcher: %v", err)
+	}
+
+	block := make(chan struct{})
+	var calls atomic.Int32
+	err = d.RegisterHandler("slow", func(_ context.Context, _ Job) error {
+		calls.Add(1)
+		<-block
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("register handler: %v", err)
+	}
+
+	if err = d.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() {
+		if stopErr := d.Stop(context.Background()); stopErr != nil {
+			t.Fatalf("stop: %v", stopErr)
+		}
+	}()
+
+	if err = d.Submit(Job{ID: "claim-1", Type: "slow"}); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+
+	waitForCondition(t, time.Second, func() bool {
+		return calls.Load() == 1
+	})
+
+	pendingMessage, ok := backend.firstPendingMessage()
+	if !ok {
+		t.Fatal("expected one pending message")
+	}
+	backend.setAutoClaimMessages(pendingMessage)
+	time.Sleep(120 * time.Millisecond)
+
+	close(block)
+
+	waitForCondition(t, time.Second, func() bool {
+		return d.Metrics().Succeeded >= 1
+	})
+	time.Sleep(120 * time.Millisecond)
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("expected one handler call, got %d", got)
+	}
+	if got := d.Metrics().Succeeded; got != 1 {
+		t.Fatalf("expected succeeded=1, got %d", got)
+	}
+}
+
+func TestDistributedDispatcherTouchesInFlightMessage(t *testing.T) {
+	backend := newFakeDistributedBackend()
+	d, err := NewDistributedDispatcher(DistributedConfig{
+		Workers:       1,
+		Stream:        "jobs",
+		Group:         "group-a",
+		BatchSize:     4,
+		Block:         10 * time.Millisecond,
+		ClaimInterval: 500 * time.Millisecond,
+		ClaimMinIdle:  40 * time.Millisecond,
+		RetryJitter:   0,
+	}, backend)
+	if err != nil {
+		t.Fatalf("new distributed dispatcher: %v", err)
+	}
+
+	err = d.RegisterHandler("slow", func(_ context.Context, _ Job) error {
+		time.Sleep(220 * time.Millisecond)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("register handler: %v", err)
+	}
+
+	if err = d.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() {
+		if stopErr := d.Stop(context.Background()); stopErr != nil {
+			t.Fatalf("stop: %v", stopErr)
+		}
+	}()
+
+	if err = d.Submit(Job{ID: "touch-1", Type: "slow", MaxAttempts: 1}); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+
+	waitForCondition(t, 2*time.Second, func() bool {
+		return d.Metrics().Succeeded == 1
+	})
+
+	if touches := backend.totalTouches(); touches == 0 {
+		t.Fatal("expected at least one heartbeat touch")
+	}
+}
+
+func TestDistributedDispatcherPublishesDeadLetterOnTerminalFailure(t *testing.T) {
+	backend := newFakeDistributedBackend()
+	d, err := NewDistributedDispatcher(DistributedConfig{
+		Workers:            1,
+		Stream:             "jobs",
+		Group:              "group-a",
+		BatchSize:          4,
+		Block:              10 * time.Millisecond,
+		ClaimInterval:      100 * time.Millisecond,
+		ClaimMinIdle:       200 * time.Millisecond,
+		RetryJitter:        0,
+		DefaultMaxAttempts: 1,
+	}, backend)
+	if err != nil {
+		t.Fatalf("new distributed dispatcher: %v", err)
+	}
+
+	err = d.RegisterHandler("fail", func(_ context.Context, _ Job) error {
+		return errors.New("boom")
+	})
+	if err != nil {
+		t.Fatalf("register handler: %v", err)
+	}
+
+	if err = d.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() {
+		if stopErr := d.Stop(context.Background()); stopErr != nil {
+			t.Fatalf("stop: %v", stopErr)
+		}
+	}()
+
+	if err = d.Submit(Job{ID: "dlq-1", Type: "fail"}); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+
+	waitForCondition(t, 2*time.Second, func() bool {
+		return d.Metrics().Failed == 1
+	})
+
+	body, ok := backend.deadLetterBody(0)
+	if !ok {
+		t.Fatal("expected one dead letter message")
+	}
+
+	var payload distributedDeadLetter
+	if err = json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("unmarshal dead letter: %v", err)
+	}
+
+	if payload.MessageID == "" {
+		t.Fatal("dead letter message id should not be empty")
+	}
+	if payload.Reason != "max_attempts_exhausted" {
+		t.Fatalf("unexpected dead letter reason: %s", payload.Reason)
+	}
+	if payload.Error != "boom" {
+		t.Fatalf("unexpected dead letter error: %s", payload.Error)
+	}
+	if payload.Job == nil || payload.Job.ID != "dlq-1" {
+		t.Fatalf("unexpected dead letter job payload: %#v", payload.Job)
+	}
+	if payload.Attempt != 1 {
+		t.Fatalf("expected dead letter attempt=1, got %d", payload.Attempt)
+	}
+}
+
+func TestDistributedDispatcherPublishesDeadLetterOnDecodeFailure(t *testing.T) {
+	backend := newFakeDistributedBackend()
+	messageID := backend.enqueueRawMessage([]byte("not-json"))
+
+	d, err := NewDistributedDispatcher(DistributedConfig{
+		Workers:       1,
+		Stream:        "jobs",
+		Group:         "group-a",
+		BatchSize:     4,
+		Block:         10 * time.Millisecond,
+		ClaimInterval: 100 * time.Millisecond,
+		ClaimMinIdle:  200 * time.Millisecond,
+		RetryJitter:   0,
+	}, backend)
+	if err != nil {
+		t.Fatalf("new distributed dispatcher: %v", err)
+	}
+
+	if err = d.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() {
+		if stopErr := d.Stop(context.Background()); stopErr != nil {
+			t.Fatalf("stop: %v", stopErr)
+		}
+	}()
+
+	waitForCondition(t, 2*time.Second, func() bool {
+		return d.Metrics().Failed == 1
+	})
+
+	body, ok := backend.deadLetterBody(0)
+	if !ok {
+		t.Fatal("expected one dead letter message")
+	}
+
+	var payload distributedDeadLetter
+	if err = json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("unmarshal dead letter: %v", err)
+	}
+
+	if payload.MessageID != messageID {
+		t.Fatalf("unexpected dead letter message id: %s", payload.MessageID)
+	}
+	if payload.Reason != "decode_error" {
+		t.Fatalf("unexpected dead letter reason: %s", payload.Reason)
+	}
+	if payload.Job != nil {
+		t.Fatalf("decode failure should not include parsed job: %#v", payload.Job)
+	}
+}
+
 func TestDistributedDispatcherTimeoutDetachBudgetAllowsProgress(t *testing.T) {
 	backend := newFakeDistributedBackend()
 	d, err := NewDistributedDispatcher(DistributedConfig{
@@ -246,9 +545,12 @@ type fakeDistributedBackend struct {
 
 	ensureGroupErr error
 
-	queue   []distributedMessage
-	pending map[string]distributedMessage
-	nextID  uint64
+	queue          []distributedMessage
+	pending        map[string]distributedMessage
+	autoClaimQueue []distributedMessage
+	deadLetters    [][]byte
+	touchCount     map[string]int
+	nextID         uint64
 
 	notify chan struct{}
 	closed bool
@@ -256,9 +558,11 @@ type fakeDistributedBackend struct {
 
 func newFakeDistributedBackend() *fakeDistributedBackend {
 	return &fakeDistributedBackend{
-		queue:   make([]distributedMessage, 0),
-		pending: make(map[string]distributedMessage),
-		notify:  make(chan struct{}, 1),
+		queue:       make([]distributedMessage, 0),
+		pending:     make(map[string]distributedMessage),
+		deadLetters: make([][]byte, 0),
+		touchCount:  make(map[string]int),
+		notify:      make(chan struct{}, 1),
 	}
 }
 
@@ -266,11 +570,14 @@ func (b *fakeDistributedBackend) EnsureGroup(_ context.Context) error {
 	return b.ensureGroupErr
 }
 
-func (b *fakeDistributedBackend) Add(_ context.Context, body []byte) (string, error) {
+func (b *fakeDistributedBackend) Add(_ context.Context, body []byte, maxPending int) (string, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.closed {
 		return "", ErrDispatcherClosed
+	}
+	if maxPending > 0 && len(b.queue)+len(b.pending) >= maxPending {
+		return "", ErrQueueFull
 	}
 
 	b.nextID++
@@ -322,7 +629,17 @@ func (b *fakeDistributedBackend) ReadGroup(ctx context.Context, count int64, blo
 }
 
 func (b *fakeDistributedBackend) AutoClaim(_ context.Context, _ time.Duration, start string, _ int64) ([]distributedMessage, string, error) {
-	return nil, start, nil
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(b.autoClaimQueue) == 0 {
+		return nil, start, nil
+	}
+
+	out := make([]distributedMessage, len(b.autoClaimQueue))
+	copy(out, b.autoClaimQueue)
+	b.autoClaimQueue = nil
+
+	return out, start, nil
 }
 
 func (b *fakeDistributedBackend) Ack(_ context.Context, ids ...string) error {
@@ -330,6 +647,17 @@ func (b *fakeDistributedBackend) Ack(_ context.Context, ids ...string) error {
 	for _, id := range ids {
 		delete(b.pending, id)
 	}
+	b.mu.Unlock()
+	return nil
+}
+
+func (b *fakeDistributedBackend) Touch(_ context.Context, id string) error {
+	if id == "" {
+		return nil
+	}
+
+	b.mu.Lock()
+	b.touchCount[id]++
 	b.mu.Unlock()
 	return nil
 }
@@ -351,6 +679,16 @@ func (b *fakeDistributedBackend) Len(_ context.Context) (int64, error) {
 	return int64(length), nil
 }
 
+func (b *fakeDistributedBackend) AddDeadLetter(_ context.Context, body []byte) (string, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	b.deadLetters = append(b.deadLetters, append([]byte(nil), body...))
+	b.nextID++
+
+	return fmt.Sprintf("dlq-%d", b.nextID), nil
+}
+
 func (b *fakeDistributedBackend) Close() error {
 	b.mu.Lock()
 	b.closed = true
@@ -360,4 +698,58 @@ func (b *fakeDistributedBackend) Close() error {
 	default:
 	}
 	return nil
+}
+
+func (b *fakeDistributedBackend) setAutoClaimMessages(messages ...distributedMessage) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	b.autoClaimQueue = append(make([]distributedMessage, 0, len(messages)), messages...)
+}
+
+func (b *fakeDistributedBackend) firstPendingMessage() (distributedMessage, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, message := range b.pending {
+		return message, true
+	}
+
+	return distributedMessage{}, false
+}
+
+func (b *fakeDistributedBackend) totalTouches() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	total := 0
+	for _, count := range b.touchCount {
+		total += count
+	}
+
+	return total
+}
+
+func (b *fakeDistributedBackend) deadLetterBody(index int) ([]byte, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if index < 0 || index >= len(b.deadLetters) {
+		return nil, false
+	}
+
+	return append([]byte(nil), b.deadLetters[index]...), true
+}
+
+func (b *fakeDistributedBackend) enqueueRawMessage(body []byte) string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	b.nextID++
+	id := fmt.Sprintf("id-%d", b.nextID)
+	b.queue = append(b.queue, distributedMessage{ID: id, Body: append([]byte(nil), body...)})
+	select {
+	case b.notify <- struct{}{}:
+	default:
+	}
+
+	return id
 }
