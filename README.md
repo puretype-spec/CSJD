@@ -19,7 +19,7 @@ Common failure modes:
 
 CSJD focuses on bounded execution, controlled retries, explicit failure semantics, and recoverability.
 
-## Current Capabilities
+## ✨ Features
 
 - Worker pool (`Config.Workers` / `DistributedConfig.Workers`)
 - `Submit` / `SubmitBatch`
@@ -123,6 +123,10 @@ _ = dist.Submit(dispatcher.Job{ID: "dist-1", Type: "email"})
 - ACK/DEL and DLQ failures are exposed via metrics (`finalize_errors`, `dead_letter_errors`).
 - File store locking: second process opening same store path gets `ErrJobStoreLocked`.
 
+## Contributing
+
+Contributions are welcome! Please feel free to submit a pull request.
+
 ## Testing
 
 ```bash
@@ -142,3 +146,7 @@ go test -run '^$' -bench BenchmarkDispatcherEndToEnd -benchmem ./dispatcher
 - No exactly-once guarantee in distributed mode.
 - Non-cooperative handlers/fetchers cannot be force-killed in Go.
 - Redis Streams mode currently targets one stream/group per dispatcher instance.
+
+## License
+
+This project is licensed under the MIT License.
